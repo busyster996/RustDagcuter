@@ -39,7 +39,7 @@ dagcuter/
 
 ```toml
 [dependencies]
-dagcuter = "0.1.1"
+rs-dagcuter = "0.0.1"
 tokio = { version = "1.0", features = ["full"] }
 async-trait = "0.1" 
 serde = { version = "1.0", features = ["derive"] } 
