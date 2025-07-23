@@ -1,6 +1,6 @@
 [package]
 name = "rs-dagcuter"
-version = "0.0.2"
+version = "0.1.0"
 edition = "2021"
 description = "RustDagcuter 是一个用于执行任务的有向无环图 (DAG) 的 Rust 库。它管理任务依赖关系，检测循环依赖关系，并支持可自定义的任务生命周期（执行前、执行后）。它还支持并发执行独立任务，以提高性能。"
 license = "Apache-2.0"

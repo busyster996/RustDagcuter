@@ -38,15 +38,12 @@ dagcuter/
 1. Add dependencies in `Cargo.toml`:
 
 ```toml
-[dependencies]
-rs-dagcuter = "0.0.2"
+rs-dagcuter = { version = "0.1.0" }
 tokio = { version = "1.0", features = ["full"] }
 async-trait = "0.1"
-serde = { version = "1.0", features = ["derive"] }
+tokio-util = "0.7"
 serde_json = "1.0"
-thiserror = "1.0"
-futures = "0.3"
-tokio-util = "0.7" 
+chrono = "0.4"
 ```
 
 2. Write the task and execute it:
