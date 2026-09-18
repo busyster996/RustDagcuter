@@ -1,21 +1,26 @@
 # Dagcuter 🚀
 
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE) [![Rust](https://img.shields.io/badge/rust-1.80%2B-orange.svg)](https://www.rust-lang.org)
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE) [![Rust](https://img.shields.io/badge/rust-1.80%2B-orange.svg)](https://www.rust-lang.org)
 
 [RustDagcuter](https://crates.io/crates/rs-dagcuter) is a Rust library for executing directed acyclic graphs (DAGs) of tasks. It manages task dependencies, detects cyclic dependencies, and supports customizable task lifecycles (pre-execution, post-execution). It also supports concurrent execution of independent tasks to improve performance.
+
+Alignment with [xdag](https://github.com/xmapst/xdag) includes graph validation, failure/cancellation propagation, retry with jitter, deterministic graph output, concurrency limits, progress, observers, task controls, suspension and whole-run cancellation with a grace period. The Rust API uses `TaskContext` for cancellation causes, while `TaskInput` and `TaskResult` remain JSON maps by design.
 
 ---
 
 ## ✨ Core functions
 
 - **Intelligent dependency management**: Automatically parse and schedule multi-task dependencies.
-- **Loop detection**: Real-time discovery and prevention of loop dependencies.
+- **Graph validation**: Reject missing dependencies, task-name mismatches and cycles during construction.
+- **Failure propagation**: A failed task skips its dependents; cancellation propagates as cancellation while unrelated branches continue.
 - **High concurrent execution**: Topological sorting drives parallel operation, making full use of multi-cores.
-- **Exponential backoff retry**: Built-in configurable retry strategy; supports custom intervals, multiples and maximum times.
-- **Graceful cancellation**: Supports mid-way cancellation and resource release.
-- **Execution tracking**: Real-time printing of task status and execution order.
+- **Exponential backoff retry**: Configurable attempts, interval caps, downward jitter and non-retryable errors.
+- **Cooperative cancellation**: Tasks receive a cancelable context with an inspectable cause; whole-run cancel can force settlement after a grace period.
+- **Execution tracking**: Query task states and completion order during execution.
+- **Concurrency control**: Limit active attempts without occupying slots during retry backoff.
+- **Progress and observation**: Poll state counts or receive an event for every terminal task.
+- **Task controls**: Cancel or suspend one task, or suspend and resume the whole run.
 - **Type safety**: Static type guarantee, compile-time error checking.
-- **Zero cost abstraction**: Minimal runtime overhead.
 - **Life cycle hook**: Custom logic can be inserted before/after task execution.
 
 ## 🏗️ Project structure
@@ -24,21 +29,28 @@
 dagcuter/
 ├─ src/
 │ ├─ lib.rs # Core exports and type definitions
-│ └─ executor.rs # DAG Executor Core Logic
-├─ examples/ # Example code
-| ├─ src/
-| │ └─ main.rs
-| └─ Cargo.toml
+│ ├─ control.rs # Per-task contexts and suspension gates
+│ ├─ executor.rs # DAG scheduling and states
+│ ├─ executor/ # Graph output, queries and control commands
+│ ├─ observer.rs # Terminal event types and panic handling
+│ ├─ options.rs # Constructor options
+│ ├─ progress.rs # Progress snapshots
+│ └─ retry.rs # Retry and backoff
+├─ example/ # Example code
+│ ├─ src/
+│ │ ├─ main.rs # Default successful DAG
+│ │ └─ bin/ # Independent behavior scenarios
+│ └─ Cargo.toml
 ├─ Cargo.toml
 └─ README.md
-````
+```
 
 ## 🚀 Quick start
 
 1. Add dependencies in `Cargo.toml`:
 
 ```toml
-rs-dagcuter = { version = "0.1.0" }
+rs-dagcuter = { version = "0.2.0" }
 tokio = { version = "1.0", features = ["full"] }
 async-trait = "0.1"
 tokio-util = "0.7"
@@ -80,9 +92,10 @@ impl Task for ExampleTask {
 
     async fn execute(
         &self,
-        _ctx: CancellationToken,
+        _ctx: TaskContext,
+        _attempt: u64,
         _input: &TaskInput,
-    ) -> Result<TaskResult, Error> {
+    ) -> TaskOutcome {
         println!("执行任务: {}", self.name);
 
         // 模拟任务执行时间
@@ -92,7 +105,7 @@ impl Task for ExampleTask {
         result.insert("status".to_string(), serde_json::json!("completed"));
         result.insert("task_name".to_string(), serde_json::json!(self.name));
         result.insert("timestamp".to_string(), serde_json::json!(chrono::Utc::now().to_rfc3339()));
-        Ok(result)
+        TaskOutcome::success(result)
     }
 }
 
@@ -132,7 +145,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 
 
-    let mut dag = Dag::new(tasks)?;
+    let dag = Dag::new(tasks)?;
     let ctx = CancellationToken::new();
 
     println!("=== 任务依赖图 ===");
@@ -161,9 +174,27 @@ cargo run
 
 ---
 
+## Runnable scenarios
+
+`cd example && cargo run` still runs the successful DAG. The other binaries check their own expected outcomes and exit successfully even when the demonstrated tasks fail or are canceled:
+
+| Command (from `example/`) | Behavior |
+| --- | --- |
+| `cargo run --bin validation` | Invalid graphs, failed dependency, skipped child, partial success |
+| `cargo run --bin retry_hooks` | Retry, lifecycle hooks, output alongside error, non-retryable panic |
+| `cargo run --bin task_control` | Independent suspension sources and targeted cancellation cause |
+| `cargo run --bin observe` | Concurrency limit, progress, events, observer panic |
+| `cargo run --bin cancel_grace` | Cooperative stop, grace expiry, discarded late result |
+
+The task/observer panic demonstrations intentionally emit Rust's default panic-hook message; the scheduler catches those panics and each binary verifies the resulting state.
+
+---
+
 ## 📚 API Overview
 
-### `Task` attribute
+`validate(&tasks)` checks missing dependencies and cycles without constructing a `Dag`. `Dag::new` additionally rejects task names that do not match their map keys.
+
+### `Task` trait
 
 ```rust
 #[async_trait]
@@ -174,7 +205,8 @@ pub trait Task: Send + Sync {
 
     async fn pre_execution(
         &self,
-        _ctx: CancellationToken,
+        _ctx: TaskContext,
+        _attempt: u64,
         _input: &TaskInput,
     ) -> Result<(), Error> {
         Ok(())
@@ -182,19 +214,24 @@ pub trait Task: Send + Sync {
 
     async fn execute(
         &self,
-        ctx: CancellationToken,
+        ctx: TaskContext,
+        attempt: u64,
         input: &TaskInput,
-    ) -> Result<TaskResult, Error>;
+    ) -> TaskOutcome;
 
     async fn post_execution(
         &self,
-        _ctx: CancellationToken,
-        _output: &TaskResult,
+        _ctx: TaskContext,
+        _attempt: u64,
+        _output: Option<&TaskResult>,
+        _error: Option<&Error>,
     ) -> Result<(), Error> {
         Ok(())
     }
 }
 ```
+
+`TaskOutcome::success(output)` and `TaskOutcome::failure(error)` cover normal cases. `TaskOutcome::with_error(output, error)` lets `post_execution` see both values from one attempt; when `error` is present, `output` is not passed downstream or included in successful results. `TaskInput` and `TaskResult` retain their JSON map types.
 
 ### `RetryPolicy`
 
@@ -203,8 +240,9 @@ pub trait Task: Send + Sync {
 pub struct RetryPolicy {
     pub interval: Duration,         // Initial retry interval
     pub max_interval: Duration,     // Maximum retry interval
-    pub max_attempts: i32,          // Maximum number of retries
+    pub max_attempts: i64,          // Total attempts; 0 = 1, negative = unlimited
     pub multiplier: f64,            // Retry interval exponential
+    pub jitter: f64,                // Downward jitter in [0, 1]
 }
 
 impl Default for RetryPolicy {
@@ -214,9 +252,12 @@ impl Default for RetryPolicy {
             max_interval: Duration::from_secs(30),
             max_attempts: 1,
             multiplier: 2.0,
+            jitter: 0.0,
         }
     }
 }
+
+pub const INFINITE_ATTEMPTS: i64 = -1;
 ```
 
 ### `Dag`
@@ -226,17 +267,43 @@ impl Dag {
     /// Create a new DAG instance
     pub fn new(tasks: HashMap<String, BoxTask>) -> Result<Self, Error>;
 
+    /// Configure an active-attempt limit and an optional terminal-state observer
+    pub fn with_options(tasks: HashMap<String, BoxTask>, options: DagOptions) -> Result<Self, Error>;
+
     /// Execute all tasks in the DAG
     pub async fn execute(
-        &mut self,
+        &self,
         ctx: CancellationToken,
-    ) -> Result<HashMap<String, TaskResult>, Error>;
+    ) -> Result<HashMap<String, TaskResult>, RunError>;
+
+    /// Snapshot of each task's terminal state, error and attempt count
+    pub fn task_results(&self) -> HashMap<String, TaskStatus>;
+
+    pub fn state(&self, name: &str) -> Option<TaskState>;
+    pub fn states(&self) -> HashMap<String, TaskState>;
+    pub fn phase(&self) -> RunPhase;
+    pub fn progress(&self) -> Progress;
+
+    pub fn cancel_task(&self, name: &str) -> Result<(), Error>;
+    pub fn cancel_task_with_cause(&self, name: &str, cause: CancelCause) -> Result<(), Error>;
+    pub fn suspend_task(&self, name: &str) -> Result<(), Error>;
+    pub fn resume_task(&self, name: &str) -> Result<(), Error>;
+    pub fn suspended_task(&self, name: &str) -> bool;
+    pub fn suspend(&self);
+    pub fn resume(&self);
+    pub fn suspended(&self) -> bool;
+    pub fn canceled(&self) -> bool;
+    pub async fn cancel(&self, grace: Duration) -> Result<(), Error>;
+    pub async fn cancel_with_cause(&self, grace: Duration, cause: CancelCause) -> Result<(), Error>;
 
     /// Get the execution order of the DAG
     pub async fn execution_order(&self) -> String;
 
     /// Print the DAG graph
     pub fn print_graph(&self);
+
+    /// Write a stable graph view to any writer
+    pub fn write_graph(&self, writer: &mut impl std::io::Write) -> std::io::Result<()>;
 }
 ```
 
@@ -245,30 +312,81 @@ impl Dag {
 ```rust
 #[derive(Error, Debug)]
 pub enum Error {
-    #[error("Circular dependency detected")]
-    CircularDependency,
+    #[error("circular dependency detected: {0}")]
+    CircularDependency(String),
+
+    #[error("task {task:?} depends on unknown task {dependency:?}")]
+    UnknownDependency { task: String, dependency: String },
+
+    #[error("task map key {key:?} does not match task name {name:?}")]
+    TaskNameMismatch { key: String, name: String },
+
+    #[error("this DAG has already been executed")]
+    AlreadyExecuted,
     
-    #[error("Task execution failed: {0}")]
+    #[error("task execution failed: {0}")]
     TaskExecution(String),
     
-    #[error("Context cancelled: {0}")]
+    #[error("execution canceled: {0}")]
     ContextCancelled(String),
     
-    #[error("Retry failed: {0}")]
-    RetryFailed(String),
+    #[error("retries exhausted: {last}")]
+    RetryFailed { last: Box<Error> },
+
+    #[error("non-retryable error: {0}")]
+    NonRetryable(Box<Error>),
+
+    #[error("execute: {execute}; post_execution: {post}")]
+    TaskAndPostExecution { execute: Box<Error>, post: Box<Error> },
+
+    #[error("execution canceled during retry wait; last attempt: {last}")]
+    RetryInterrupted { last: Box<Error> },
+
+    #[error("task {task:?} panicked on attempt {attempt}: {message}")]
+    TaskPanic { task: String, attempt: u64, message: String, stack: String, source: Option<Box<Error>> },
+
+    #[error("observer panicked on event for task {task:?}: {message}")]
+    ObserverPanic { task: String, message: String, stack: String },
+
+    #[error("unknown task {0:?}")]
+    UnknownTask(String),
+
+    #[error("task {0:?} already reached a terminal state")]
+    TaskAlreadyDone(String),
+
+    #[error("task {task:?} canceled")]
+    TaskCanceled { task: String, reason: CancelReason, last: Option<Box<Error>> },
+
+    #[error("run canceled")]
+    RunCanceled { reason: CancelReason, last: Option<Box<Error>> },
+
+    #[error("cancel grace period expired")]
+    GracePeriodExpired,
 }
 ```
 
 ## 🔧 Advanced usage
 
-* Custom retry: adjust `interval`, `multiplier`, `max_attempts`
+* Custom retry: adjust `interval`, `multiplier`, `max_attempts` and `jitter`; use `INFINITE_ATTEMPTS` for unlimited attempts.
+
+* Permanent failures: return `Error::NonRetryable(Box::new(cause))` to stop retrying immediately.
 
 * Lifecycle hook: override `pre_execution`/`post_execution`
 
-* Cancellation and timeout: combine `CancellationToken` to control execution
+* Cancellation and timeout: pass a `CancellationToken` to `execute`; task implementations receive a `TaskContext` and can await `ctx.cancelled()` or inspect `ctx.cause()` (`Task`, `Run` or `Parent`). Use `cancel_task(name)` to stop one task or `cancel(grace)` to stop the run and wait for a grace period. After grace expires, unresolved tasks are marked canceled and late results are discarded, but uncooperative task bodies may still be running.
+
+* Suspension: `suspend_task`/`resume_task` and `suspend`/`resume` are independent; both must be resumed before the next attempt starts. Cancellation wakes suspended tasks. Tasks already executing are not paused mid-attempt.
+
+* Partial results: on failure, `RunError.outputs` still holds outputs from successful tasks; `task_results()` exposes all states.
+
+* Configure concurrency and observation with `DagOptions::default().max_concurrency(4).observer(|event| { /* record event */ })`. The observer runs after the task state is committed, may be called concurrently, and must not wait for `execute` to return. Observer panics appear in `RunError.observer_failures` without changing task states.
+
+* Poll `dag.progress()` for `total`, `pending`, `success`, `skipped`, `canceled` and `failed` counts; `ratio()` is 1.0 for an empty graph.
+
+* Each `Dag` runs only once; construct a fresh instance for another run.
 
 * Complex data flow: process `TaskInput` in `execute` and return a custom `TaskResult`
 
 ## 📝 License
 
-This project adopts the MIT protocol, see [LICENSE](LICENSE) for details.
+This project is licensed under Apache-2.0, see [LICENSE](LICENSE) for details.

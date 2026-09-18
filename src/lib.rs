@@ -1,209 +1,299 @@
+mod control;
 mod executor;
+mod observer;
+mod options;
+mod progress;
+mod retry;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
-use tokio::time::sleep;
-use tokio_util::sync::CancellationToken;
 
-/// Type alias for task execution results
-/// Uses HashMap to allow flexible key-value output data
 pub type TaskResult = HashMap<String, serde_json::Value>;
-
-/// Type alias for task input parameters
-/// Provides flexibility for passing various data types between tasks
 pub type TaskInput = HashMap<String, serde_json::Value>;
-
-/// Type alias for thread-safe task references
-/// Arc enables sharing tasks across threads safely
 pub type BoxTask = Arc<dyn Task>;
+pub const INFINITE_ATTEMPTS: i64 = -1;
 
-/// Comprehensive error types for task execution system
-/// Uses thiserror for automatic error trait implementations
 #[derive(Error, Debug)]
 pub enum Error {
-    #[error("Circular dependency detected")]
-    CircularDependency,
-    #[error("Task execution failed: {0}")]
+    #[error("circular dependency detected: {0}")]
+    CircularDependency(String),
+    #[error("task {task:?} depends on unknown task {dependency:?}")]
+    UnknownDependency { task: String, dependency: String },
+    #[error("task map key {key:?} does not match task name {name:?}")]
+    TaskNameMismatch { key: String, name: String },
+    #[error("this DAG has already been executed")]
+    AlreadyExecuted,
+    #[error("task execution failed: {0}")]
     TaskExecution(String),
-    #[error("Context cancelled: {0}")]
+    #[error("execution canceled: {0}")]
     ContextCancelled(String),
-    #[error("Retry failed: {0}")]
-    RetryFailed(String),
+    #[error("retries exhausted: {last}")]
+    RetryFailed {
+        #[source]
+        last: Box<Error>,
+    },
+    #[error("non-retryable error: {0}")]
+    NonRetryable(#[source] Box<Error>),
+    #[error("execute: {execute}; post_execution: {post}")]
+    TaskAndPostExecution {
+        #[source]
+        execute: Box<Error>,
+        post: Box<Error>,
+    },
+    #[error("execution canceled during retry wait; last attempt: {last}")]
+    RetryInterrupted {
+        #[source]
+        last: Box<Error>,
+    },
+    #[error("task {task:?} panicked on attempt {attempt}: {message}")]
+    TaskPanic {
+        task: String,
+        attempt: u64,
+        message: String,
+        stack: String,
+        #[source]
+        source: Option<Box<Error>>,
+    },
+    #[error("observer panicked on event for task {task:?}: {message}")]
+    ObserverPanic {
+        task: String,
+        message: String,
+        stack: String,
+    },
+    #[error("unknown task {0:?}")]
+    UnknownTask(String),
+    #[error("task {0:?} already reached a terminal state")]
+    TaskAlreadyDone(String),
+    #[error("task {task:?} canceled")]
+    TaskCanceled {
+        task: String,
+        reason: CancelReason,
+        #[source]
+        last: Option<Box<Error>>,
+    },
+    #[error("run canceled")]
+    RunCanceled {
+        reason: CancelReason,
+        #[source]
+        last: Option<Box<Error>>,
+    },
+    #[error("cancel grace period expired")]
+    GracePeriodExpired,
 }
 
-/// Configuration for exponential backoff retry mechanism
-/// Implements intelligent retry logic with configurable parameters
+impl Error {
+    pub(crate) fn is_non_retryable(&self) -> bool {
+        match self {
+            Self::NonRetryable(_) => true,
+            Self::TaskAndPostExecution { execute, post } => {
+                execute.is_non_retryable() || post.is_non_retryable()
+            }
+            Self::RetryFailed { last } | Self::RetryInterrupted { last } => last.is_non_retryable(),
+            Self::TaskPanic { source, .. } => source.as_deref().is_some_and(Self::is_non_retryable),
+            _ => false,
+        }
+    }
+
+    pub(crate) fn is_run_canceled(&self) -> bool {
+        match self {
+            Self::RunCanceled { .. } => true,
+            Self::RetryFailed { last }
+            | Self::RetryInterrupted { last }
+            | Self::NonRetryable(last) => last.is_run_canceled(),
+            Self::TaskAndPostExecution { execute, post } => {
+                execute.is_run_canceled() || post.is_run_canceled()
+            }
+            Self::TaskPanic { source, .. } => source.as_deref().is_some_and(Self::is_run_canceled),
+            _ => false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskState {
+    Pending,
+    Success,
+    Skipped,
+    Canceled,
+    Failed,
+}
+
+impl TaskState {
+    pub fn done(self) -> bool {
+        self != Self::Pending
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunPhase {
+    Pending,
+    Running,
+    Success,
+    Canceled,
+    Failed,
+}
+
+impl RunPhase {
+    pub fn done(self) -> bool {
+        matches!(self, Self::Success | Self::Canceled | Self::Failed)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct TaskStatus {
+    pub state: TaskState,
+    pub error: Option<Arc<Error>>,
+    pub attempts: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct TaskFailure {
+    pub task: String,
+    pub error: Arc<Error>,
+}
+
+#[derive(Debug)]
+pub struct RunError {
+    pub outputs: HashMap<String, TaskResult>,
+    pub failures: Vec<TaskFailure>,
+    pub observer_failures: Vec<ObserverFailure>,
+    pub run_error: Option<Box<Error>>,
+}
+
+impl RunError {
+    pub fn is_already_executed(&self) -> bool {
+        matches!(self.run_error.as_deref(), Some(Error::AlreadyExecuted))
+    }
+}
+
+impl fmt::Display for RunError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(error) = &self.run_error {
+            return error.fmt(f);
+        }
+        if self.failures.is_empty() {
+            write!(
+                f,
+                "{} observer callback(s) panicked",
+                self.observer_failures.len()
+            )
+        } else if self.observer_failures.is_empty() {
+            write!(f, "{} task(s) failed or were canceled", self.failures.len())
+        } else {
+            write!(
+                f,
+                "{} task(s) failed or were canceled; {} observer callback(s) panicked",
+                self.failures.len(),
+                self.observer_failures.len()
+            )
+        }
+    }
+}
+
+impl std::error::Error for RunError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.run_error
+            .as_deref()
+            .map(|error| error as &dyn std::error::Error)
+            .or_else(|| {
+                self.failures
+                    .first()
+                    .map(|failure| failure.error.as_ref() as _)
+            })
+            .or_else(|| {
+                self.observer_failures
+                    .first()
+                    .map(|failure| failure.error.as_ref() as _)
+            })
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RetryPolicy {
-    /// Initial delay between retry attempts
     pub interval: Duration,
-    /// Maximum delay to prevent excessively long waits
     pub max_interval: Duration,
-    /// Maximum number of retry attempts (-1 for unlimited)
-    pub max_attempts: i32,
-    /// Exponential backoff multiplier (2.0 = double delay each retry)
+    /// Total attempts; zero means one attempt, and a negative value means unlimited attempts.
+    pub max_attempts: i64,
     pub multiplier: f64,
+    pub jitter: f64,
 }
 
 impl Default for RetryPolicy {
-    /// Provides sensible defaults for retry behavior
-    /// Starts with 1s delay, max 30s, exponential backoff with 2x multiplier
     fn default() -> Self {
         Self {
             interval: Duration::from_secs(1),
             max_interval: Duration::from_secs(30),
-            max_attempts: -1, // Unlimited retries by default
-            multiplier: 2.0,  // Exponential backoff
+            max_attempts: 1,
+            multiplier: 2.0,
+            jitter: 0.0,
         }
     }
 }
 
-/// Retry mechanism implementation with exponential backoff
-/// Handles transient failures gracefully with configurable policies
-struct Retry {
-    policy: RetryPolicy,
+#[derive(Debug)]
+pub struct TaskOutcome {
+    pub output: Option<TaskResult>,
+    pub error: Option<Error>,
 }
 
-impl Retry {
-    /// Creates a new retry instance with validated policy parameters
-    /// Applies sensible defaults and boundary checks to prevent invalid configurations
-    fn new(policy: Option<RetryPolicy>) -> Self {
-        let mut policy = policy.unwrap_or_default();
-
-        // Validate and set safe default values to prevent edge cases
-        if policy.interval.is_zero() {
-            policy.interval = Duration::from_secs(1);
+impl TaskOutcome {
+    pub fn success(output: TaskResult) -> Self {
+        Self {
+            output: Some(output),
+            error: None,
         }
-        if policy.max_interval.is_zero() {
-            policy.max_interval = Duration::from_secs(30);
-        }
-        if policy.multiplier <= 0.0 {
-            policy.multiplier = 2.0;
-        }
-        // Prevent extremely long delays that could hang the system
-        if policy.max_interval > Duration::from_secs(150) {
-            policy.max_interval = Duration::from_secs(150);
-        }
-
-        Self { policy }
     }
 
-    /// Executes an operation with retry logic and exponential backoff
-    /// Generic over operation type to support any async function
-    /// Respects cancellation tokens for graceful shutdown
-    async fn execute_with_retry<F, Fut, T>(
-        &self,
-        ctx: CancellationToken,
-        task_name: &str,
-        mut operation: F,
-    ) -> Result<T, Error>
-    where
-        F: FnMut(i32) -> Fut,
-        Fut: std::future::Future<Output = Result<T, Error>>,
-    {
-        // If retries disabled, execute once
-        if self.policy.max_attempts <= 0 {
-            return operation(0).await;
+    pub fn failure(error: Error) -> Self {
+        Self {
+            output: None,
+            error: Some(error),
         }
-
-        let mut last_error = None;
-
-        // Attempt execution up to max_attempts times
-        for attempt in 1..=self.policy.max_attempts {
-            // Check for cancellation before each attempt
-            if ctx.is_cancelled() {
-                return Err(Error::ContextCancelled(format!(
-                    "Context cancelled during retry attempt {}",
-                    attempt
-                )));
-            }
-
-            match operation(attempt).await {
-                Ok(result) => return Ok(result), // Success - return immediately
-                Err(e) => last_error = Some(e),  // Store error for final report
-            }
-
-            // Wait before next attempt (except after last attempt)
-            if attempt < self.policy.max_attempts {
-                let wait_time = self.calculate_backoff(attempt);
-                tokio::select! {
-                    // Respect cancellation during wait
-                    _ = ctx.cancelled() => {
-                        return Err(Error::ContextCancelled(
-                            "Context cancelled during retry wait".to_string()
-                        ));
-                    }
-                    // Wait for calculated backoff duration
-                    _ = sleep(wait_time) => {}
-                }
-            }
-        }
-
-        // All attempts failed - return comprehensive error
-        Err(Error::RetryFailed(format!(
-            "Task {} failed after {} attempts, last error: {:?}",
-            task_name, self.policy.max_attempts, last_error
-        )))
     }
 
-    /// Calculates exponential backoff delay for given attempt number
-    /// Applies multiplier and respects maximum interval limit
-    fn calculate_backoff(&self, attempt: i32) -> Duration {
-        let backoff = self.policy.interval.as_secs_f64() * self.policy.multiplier.powi(attempt - 1);
-        let result = Duration::from_secs_f64(backoff);
-        // Ensure we don't exceed maximum interval
-        result.min(self.policy.max_interval)
+    pub fn with_error(output: TaskResult, error: Error) -> Self {
+        Self {
+            output: Some(output),
+            error: Some(error),
+        }
     }
 }
 
-/// Core trait defining task behavior and lifecycle
-/// All tasks must implement this trait to be executable by the DAG
-/// Provides hooks for custom pre/post processing logic
 #[async_trait]
 pub trait Task: Send + Sync {
-    /// Returns the unique name identifier for this task
     fn name(&self) -> &str;
-
-    /// Returns list of task names this task depends on
-    /// Used to build the dependency graph
     fn dependencies(&self) -> Vec<String>;
-
-    /// Returns retry policy for this specific task
-    /// None means use system defaults
     fn retry_policy(&self) -> Option<RetryPolicy>;
 
-    /// Pre-execution hook called before main task execution
-    /// Useful for setup, validation, or logging
-    /// Default implementation does nothing
     async fn pre_execution(
         &self,
-        _ctx: CancellationToken,
+        _ctx: TaskContext,
+        _attempt: u64,
         _input: &TaskInput,
     ) -> Result<(), Error> {
         Ok(())
     }
 
-    /// Main task execution logic - must be implemented by each task
-    /// Receives input from dependencies and returns results
-    /// This is the core business logic of the task
-    async fn execute(&self, ctx: CancellationToken, input: &TaskInput)
-    -> Result<TaskResult, Error>;
+    async fn execute(&self, ctx: TaskContext, attempt: u64, input: &TaskInput) -> TaskOutcome;
 
-    /// Post-execution hook called after successful main execution
-    /// Useful for cleanup, notifications, or result processing
-    /// Default implementation does nothing
     async fn post_execution(
         &self,
-        _ctx: CancellationToken,
-        _output: &TaskResult,
+        _ctx: TaskContext,
+        _attempt: u64,
+        _output: Option<&TaskResult>,
+        _error: Option<&Error>,
     ) -> Result<(), Error> {
         Ok(())
     }
 }
 
-// Re-export the DAG executor for external use
-pub use crate::executor::Dag;
+pub use control::{CancelCause, CancelKind, CancelReason, TaskContext};
+pub use executor::{validate, Dag};
+pub use observer::{Event, ObserverFailure};
+pub use options::DagOptions;
+pub use progress::Progress;

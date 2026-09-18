@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use rs_dagcuter::{BoxTask, Dag, Error, RetryPolicy, Task, TaskInput, TaskResult};
+use rs_dagcuter::{BoxTask, Dag, RetryPolicy, Task, TaskContext, TaskInput, TaskOutcome};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
@@ -27,11 +27,7 @@ impl Task for ExampleTask {
         })
     }
 
-    async fn execute(
-        &self,
-        _ctx: CancellationToken,
-        _input: &TaskInput,
-    ) -> Result<TaskResult, Error> {
+    async fn execute(&self, _ctx: TaskContext, _attempt: u64, _input: &TaskInput) -> TaskOutcome {
         println!("执行任务: {}", self.name);
 
         // 模拟任务执行时间
@@ -44,7 +40,7 @@ impl Task for ExampleTask {
             "timestamp".to_string(),
             serde_json::json!(chrono::Utc::now().to_rfc3339()),
         );
-        Ok(result)
+        TaskOutcome::success(result)
     }
 }
 
@@ -104,7 +100,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }),
     );
 
-    let mut dag = Dag::new(tasks)?;
+    let dag = Dag::new(tasks)?;
     let ctx = CancellationToken::new();
 
     println!("=== 任务依赖图 ===");

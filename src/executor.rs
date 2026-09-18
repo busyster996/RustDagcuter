@@ -1,327 +1,714 @@
-use crate::{BoxTask, Error, Retry, TaskInput, TaskResult};
-use futures::future::try_join_all;
-use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
-use tokio::sync::{Mutex, RwLock, Semaphore, mpsc};
+mod control;
+mod graph;
+mod query;
+
+use crate::control::TaskControl;
+use crate::options::Observer;
+use crate::retry::Retry;
+use crate::{
+    BoxTask, CancelKind, CancelReason, DagOptions, Error, Event, ObserverFailure, RunError,
+    RunPhase, TaskContext, TaskFailure, TaskInput, TaskResult, TaskState, TaskStatus,
+};
+use futures::future::FutureExt;
+use futures::stream::{FuturesUnordered, StreamExt};
+use std::any::Any;
+use std::collections::HashMap;
+use std::future::Future;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use tokio::sync::{watch, Semaphore};
+use tokio::task::{AbortHandle, JoinHandle};
 use tokio_util::sync::CancellationToken;
 
-/// Detects cycles in the task dependency graph using Depth-First Search (DFS)
-/// This is crucial to prevent infinite loops during execution
-/// Returns true if a cycle is detected, false otherwise
-fn has_cycle(tasks: &HashMap<String, BoxTask>) -> bool {
-    let mut visited = HashSet::new(); // Tracks all visited nodes
-    let mut rec_stack = HashSet::new(); // Tracks nodes in current recursion path
-
-    /// DFS helper function that traverses the dependency graph
-    /// Uses recursion stack to detect back edges (cycles)
-    fn dfs(
-        task_name: &str,
-        tasks: &HashMap<String, BoxTask>,
-        visited: &mut HashSet<String>,
-        rec_stack: &mut HashSet<String>,
-    ) -> bool {
-        // If current node is in recursion stack, we found a back edge (cycle)
-        if rec_stack.contains(task_name) {
-            return true; // Cycle detected
-        }
-        // If already processed this node, no need to check again
-        if visited.contains(task_name) {
-            return false; // Already processed
-        }
-
-        // Mark current node as visited and add to recursion stack
-        visited.insert(task_name.to_string());
-        rec_stack.insert(task_name.to_string());
-
-        // Recursively check all dependencies of current task
-        if let Some(task) = tasks.get(task_name) {
-            for dep in task.dependencies() {
-                if dfs(&dep, tasks, visited, rec_stack) {
-                    return true; // Cycle found in dependency
-                }
-            }
-        }
-
-        // Remove from recursion stack when backtracking
-        rec_stack.remove(task_name);
-        false
-    }
-
-    // Check each task as potential starting point for cycle detection
-    for task_name in tasks.keys() {
-        if !visited.contains(task_name) && dfs(task_name, tasks, &mut visited, &mut rec_stack) {
-            return true;
-        }
-    }
-
-    false
+struct RunState {
+    phase: RunPhase,
+    statuses: HashMap<String, TaskStatus>,
+    outputs: HashMap<String, TaskResult>,
+    order: Vec<String>,
+    cancel_reported: bool,
+    run_suspended: bool,
+    degrees: HashMap<String, usize>,
 }
 
-/// DAG (Directed Acyclic Graph) Executor for task scheduling
-/// Manages task dependencies and executes them in topological order
-/// Uses Kahn's algorithm for topological sorting with concurrent execution
+struct Completion {
+    state: TaskState,
+    output: Option<TaskResult>,
+    error: Option<Error>,
+    attempts: u64,
+}
+
+impl Completion {
+    fn failed(error: Error, attempts: u64) -> Self {
+        Self {
+            state: TaskState::Failed,
+            output: None,
+            error: Some(error),
+            attempts,
+        }
+    }
+}
+
+fn cancellation_error(error: Option<Error>, reported: &mut bool) -> Option<Error> {
+    match error {
+        Some(error) if !*reported => {
+            *reported = true;
+            Some(error)
+        }
+        Some(Error::RetryInterrupted { last }) => Some(*last),
+        _ => None,
+    }
+}
+
 pub struct Dag {
-    /// All tasks indexed by their names
     tasks: HashMap<String, BoxTask>,
-    /// Shared storage for task execution results, protected by RwLock for concurrent access
-    results: Arc<RwLock<HashMap<String, TaskResult>>>,
-    /// In-degree count for each task (number of dependencies)
-    /// Used for topological sorting - tasks with 0 in-degree can be executed
-    in_degrees: HashMap<String, i32>,
-    /// Maps each task to its dependent tasks (reverse dependency)
-    /// Used to update in-degrees when a task completes
+    dependencies: HashMap<String, Vec<String>>,
     dependents: HashMap<String, Vec<String>>,
-    /// Records the actual execution order for debugging and monitoring
-    execution_order: Arc<Mutex<Vec<String>>>,
+    in_degrees: HashMap<String, usize>,
+    controls: HashMap<String, Arc<TaskControl>>,
+    semaphore: Option<Arc<Semaphore>>,
+    observer: Option<Observer>,
+    start_gate: Mutex<()>,
+    started: AtomicBool,
+    cancel_requested: AtomicBool,
+    cancel_reason: Mutex<Option<crate::CancelReason>>,
+    force: watch::Sender<bool>,
+    done: watch::Sender<bool>,
+    run: Mutex<RunState>,
+}
+
+struct ExecutionGuard<'a> {
+    dag: &'a Dag,
+    ctx: CancellationToken,
+    handles: Vec<AbortHandle>,
+    finished: bool,
+}
+
+impl Drop for ExecutionGuard<'_> {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        self.ctx.cancel();
+        for handle in &self.handles {
+            handle.abort();
+        }
+        let mut run = self.dag.run.lock().unwrap();
+        let mut cancel_reported = run.cancel_reported;
+        for status in run.statuses.values_mut() {
+            if !status.state.done() {
+                status.state = TaskState::Canceled;
+                status.error = cancellation_error(
+                    Some(Error::ContextCancelled(
+                        "execution future was dropped".into(),
+                    )),
+                    &mut cancel_reported,
+                )
+                .map(Arc::new);
+            }
+        }
+        run.cancel_reported = cancel_reported;
+        run.phase = if run
+            .statuses
+            .values()
+            .any(|status| status.state == TaskState::Failed)
+        {
+            RunPhase::Failed
+        } else if run
+            .statuses
+            .values()
+            .any(|status| status.state == TaskState::Canceled)
+        {
+            RunPhase::Canceled
+        } else {
+            RunPhase::Success
+        };
+        drop(run);
+        self.dag.done.send_replace(true);
+    }
 }
 
 impl Dag {
-    /// Creates a new DAG executor from a collection of tasks
-    /// Validates that the dependency graph is acyclic and builds internal structures
     pub fn new(tasks: HashMap<String, BoxTask>) -> Result<Self, Error> {
-        // Prevent infinite loops by checking for circular dependencies
-        if has_cycle(&tasks) {
-            return Err(Error::CircularDependency);
-        }
+        Self::with_options(tasks, DagOptions::default())
+    }
 
-        let mut in_degrees = HashMap::new();
+    pub fn with_options(
+        tasks: HashMap<String, BoxTask>,
+        options: DagOptions,
+    ) -> Result<Self, Error> {
+        let mut names: Vec<_> = tasks.keys().cloned().collect();
+        names.sort();
+
+        let dependencies = snapshot_dependencies(&tasks, true)?;
+
         let mut dependents: HashMap<String, Vec<String>> = HashMap::new();
-
-        // Build topological sorting data structures
-        // Calculate in-degree (dependency count) for each task
-        // Build reverse dependency mapping for efficient updates
-        for (name, task) in &tasks {
-            in_degrees.insert(name.clone(), task.dependencies().len() as i32);
-            for dep in task.dependencies() {
+        let mut in_degrees = HashMap::new();
+        let mut statuses = HashMap::new();
+        let mut controls = HashMap::new();
+        for name in &names {
+            in_degrees.insert(name.clone(), dependencies[name].len());
+            statuses.insert(
+                name.clone(),
+                TaskStatus {
+                    state: TaskState::Pending,
+                    error: None,
+                    attempts: 0,
+                },
+            );
+            controls.insert(name.clone(), Arc::new(TaskControl::new(name.clone())));
+            for dependency in &dependencies[name] {
                 dependents
-                    .entry(dep)
-                    .or_insert_with(Vec::new)
+                    .entry(dependency.clone())
+                    .or_default()
                     .push(name.clone());
             }
         }
+        for children in dependents.values_mut() {
+            children.sort();
+        }
+
+        let degrees = in_degrees.clone();
+        let (force, _) = watch::channel(false);
+        let (done, _) = watch::channel(false);
 
         Ok(Self {
             tasks,
-            results: Arc::new(RwLock::new(HashMap::new())),
-            in_degrees,
+            dependencies,
             dependents,
-            execution_order: Arc::new(Mutex::new(Vec::new())),
+            in_degrees,
+            controls,
+            semaphore: (options.max_concurrency > 0).then(|| {
+                Arc::new(Semaphore::new(
+                    (options.max_concurrency as usize).min(Semaphore::MAX_PERMITS),
+                ))
+            }),
+            observer: options.observer,
+            start_gate: Mutex::new(()),
+            started: AtomicBool::new(false),
+            cancel_requested: AtomicBool::new(false),
+            cancel_reason: Mutex::new(None),
+            force,
+            done,
+            run: Mutex::new(RunState {
+                phase: RunPhase::Pending,
+                statuses,
+                outputs: HashMap::new(),
+                order: Vec::new(),
+                cancel_reported: false,
+                run_suspended: false,
+                degrees,
+            }),
         })
     }
 
-    /// Executes all tasks in dependency order with support for cancellation
-    /// Uses modified Kahn's algorithm with concurrent task execution
-    /// Returns all task results or an error if execution fails
-    pub async fn execute(
-        &mut self,
-        ctx: CancellationToken,
-    ) -> Result<HashMap<String, TaskResult>, Error> {
-        // Reset state for fresh execution
-        self.results.write().await.clear();
-        self.execution_order.lock().await.clear();
+    // Every ready task receives a snapshot after all of its dependencies have settled.
+    fn prepare(&self, name: &str) -> (TaskState, TaskInput) {
+        let run = self.run.lock().unwrap();
+        let mut blocked = TaskState::Pending;
+        for dependency in &self.dependencies[name] {
+            match run.statuses[dependency].state {
+                TaskState::Canceled => blocked = TaskState::Canceled,
+                TaskState::Success => {}
+                _ if blocked != TaskState::Canceled => blocked = TaskState::Skipped,
+                _ => {}
+            }
+        }
+        if blocked != TaskState::Pending {
+            return (blocked, HashMap::new());
+        }
+        let input = self.dependencies[name]
+            .iter()
+            .map(|dependency| {
+                let values = run.outputs[dependency]
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect();
+                (dependency.clone(), serde_json::Value::Object(values))
+            })
+            .collect();
+        (TaskState::Pending, input)
+    }
 
-        // Communication channels for task scheduling
-        let (task_tx, mut task_rx) = mpsc::unbounded_channel::<String>(); // Ready tasks
-        let (completion_tx, mut completion_rx) = mpsc::unbounded_channel::<String>(); // Completed tasks
-        let in_degrees = Arc::new(Mutex::new(self.in_degrees.clone()));
-        let mut remaining_tasks = self.tasks.len();
+    fn spawn(
+        name: String,
+        task: BoxTask,
+        blocked: TaskState,
+        input: TaskInput,
+        ctx: TaskContext,
+        semaphore: Option<Arc<Semaphore>>,
+    ) -> (impl Future<Output = (String, Completion)>, AbortHandle) {
+        let task_name = name.clone();
+        let join = tokio::spawn(async move {
+            Self::run_task(task_name.clone(), task, blocked, input, ctx, semaphore).await
+        });
+        let abort = join.abort_handle();
+        (
+            async move {
+                let completion = match join.await {
+                    Ok(completion) => completion,
+                    Err(error) if error.is_panic() => {
+                        Completion::failed(Self::task_panic(name.clone(), 0, error.into_panic()), 0)
+                    }
+                    Err(error) => Completion::failed(
+                        Error::TaskExecution(format!("task {name:?} abandoned: {error}")),
+                        0,
+                    ),
+                };
+                (name, completion)
+            },
+            abort,
+        )
+    }
 
-        // Initialize with tasks that have no dependencies (in-degree = 0)
-        // These can be executed immediately
-        {
-            let degrees = in_degrees.lock().await;
-            for (name, &degree) in degrees.iter() {
-                if degree == 0 {
-                    task_tx.send(name.clone()).map_err(|_| {
-                        Error::TaskExecution("Failed to send initial task".to_string())
-                    })?;
+    async fn run_task(
+        name: String,
+        task: BoxTask,
+        blocked: TaskState,
+        input: TaskInput,
+        ctx: TaskContext,
+        semaphore: Option<Arc<Semaphore>>,
+    ) -> Completion {
+        if ctx.is_cancelled() {
+            return Completion {
+                state: TaskState::Canceled,
+                output: None,
+                error: Some(ctx.cancellation_error(None)),
+                attempts: 0,
+            };
+        }
+        if blocked != TaskState::Pending {
+            return Completion {
+                state: blocked,
+                output: None,
+                error: None,
+                attempts: 0,
+            };
+        }
+
+        let policy = Retry::new(task.retry_policy());
+        let control = ctx.control().clone();
+        let (result, attempts) = policy
+            .run(ctx.token(), semaphore, Some(control.clone()), |attempt| {
+                control.attempts.store(attempt, Ordering::Release);
+                let task = task.clone();
+                let ctx = ctx.clone();
+                let input = input.clone();
+                let name = name.clone();
+                async move {
+                    let attempt_result = std::panic::AssertUnwindSafe(async {
+                        task.pre_execution(ctx.clone(), attempt, &input).await?;
+                        let outcome = task.execute(ctx.clone(), attempt, &input).await;
+                        let post = task
+                            .post_execution(
+                                ctx,
+                                attempt,
+                                outcome.output.as_ref(),
+                                outcome.error.as_ref(),
+                            )
+                            .await;
+                        match (outcome.output, outcome.error, post) {
+                            (_, Some(original), Err(post)) => Err(Error::TaskAndPostExecution {
+                                execute: Box::new(original),
+                                post: Box::new(post),
+                            }),
+                            (_, _, Err(post)) => Err(post),
+                            (_, Some(error), Ok(())) => Err(error),
+                            (Some(output), None, Ok(())) => Ok(output),
+                            (None, None, Ok(())) => Ok(TaskResult::new()),
+                        }
+                    })
+                    .catch_unwind()
+                    .await;
+                    match attempt_result {
+                        Ok(result) => result,
+                        Err(payload) => Err(Self::task_panic(name, attempt, payload)),
+                    }
+                }
+            })
+            .await;
+
+        match result {
+            Ok(output) => Completion {
+                state: TaskState::Success,
+                output: Some(output),
+                error: None,
+                attempts,
+            },
+            Err(error) => {
+                let interrupted = ctx.is_cancelled()
+                    && matches!(
+                        &error,
+                        Error::ContextCancelled(_) | Error::RetryInterrupted { .. }
+                    );
+                let canceled = interrupted || error.is_run_canceled();
+                Completion {
+                    state: if canceled {
+                        TaskState::Canceled
+                    } else {
+                        TaskState::Failed
+                    },
+                    output: None,
+                    error: Some(if interrupted {
+                        ctx.cancellation_error(Some(error))
+                    } else {
+                        error
+                    }),
+                    attempts,
                 }
             }
         }
+    }
 
-        // Semaphore to limit concurrent task execution and prevent resource exhaustion
-        let semaphore = Arc::new(Semaphore::new(1024));
-        let mut handles = Vec::new();
+    fn force_settle(&self) -> Vec<Event> {
+        let reason = self
+            .cancel_reason
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_else(|| CancelReason::new(CancelKind::Run, None));
+        let mut run = self.run.lock().unwrap();
+        let mut names: Vec<_> = run.statuses.keys().cloned().collect();
+        names.sort();
+        let mut events = Vec::new();
+        for name in names {
+            let status = run.statuses.get_mut(&name).unwrap();
+            if status.state.done() {
+                continue;
+            }
+            status.state = TaskState::Canceled;
+            status.attempts = self.controls[&name].attempts.load(Ordering::Acquire);
+            status.error = Some(Arc::new(Error::RunCanceled {
+                reason: reason.clone(),
+                last: None,
+            }));
+            events.push(Event {
+                task: name,
+                status: status.clone(),
+            });
+        }
+        events
+    }
 
-        // Main execution loop using Kahn's algorithm
-        // Processes tasks as their dependencies are satisfied
-        while remaining_tasks > 0 {
-            tokio::select! {
-                // New task is ready to execute (all dependencies satisfied)
-                Some(task_name) = task_rx.recv() => {
-                    // Acquire permit to control concurrency
-                    let permit = semaphore.clone().acquire_owned().await.map_err(|_| {
-                        Error::TaskExecution("Failed to acquire semaphore".to_string())
-                    })?;
+    fn task_panic(task: String, attempt: u64, payload: Box<dyn Any + Send>) -> Error {
+        let message = payload
+            .downcast_ref::<Error>()
+            .map(ToString::to_string)
+            .unwrap_or_else(|| crate::observer::panic_message(payload.as_ref()));
+        Error::TaskPanic {
+            task,
+            attempt,
+            message,
+            stack: std::backtrace::Backtrace::force_capture().to_string(),
+            source: payload.downcast::<Error>().ok(),
+        }
+    }
 
-                    // Spawn task execution in background
-                    let handle = self.spawn_task(
-                        ctx.clone(),
-                        task_name,
-                        completion_tx.clone(),
-                        permit,
-                    ).await;
-                    handles.push(handle);
+    fn notify(&self, event: Event, jobs: &mut Vec<(String, JoinHandle<Result<(), Error>>)>) {
+        if let Some(observer) = &self.observer {
+            let observer = observer.clone();
+            let task = event.task.clone();
+            let job =
+                tokio::task::spawn_blocking(move || crate::observer::notify(&*observer, event));
+            jobs.push((task, job));
+        }
+    }
+
+    pub async fn execute(
+        &self,
+        ctx: CancellationToken,
+    ) -> Result<HashMap<String, TaskResult>, RunError> {
+        let start_guard = self.start_gate.lock().unwrap();
+        if self.started.swap(true, Ordering::AcqRel) {
+            return Err(RunError {
+                outputs: HashMap::new(),
+                failures: Vec::new(),
+                observer_failures: Vec::new(),
+                run_error: Some(Box::new(Error::AlreadyExecuted)),
+            });
+        }
+        self.run.lock().unwrap().phase = RunPhase::Running;
+        let mut guard = ExecutionGuard {
+            dag: self,
+            ctx: ctx.child_token(),
+            handles: Vec::new(),
+            finished: false,
+        };
+
+        let contexts: HashMap<_, _> = self
+            .controls
+            .iter()
+            .map(|(name, control)| (name.clone(), control.bind(&guard.ctx)))
+            .collect();
+
+        let mut roots: Vec<_> = self
+            .in_degrees
+            .iter()
+            .filter(|(_, count)| **count == 0)
+            .map(|(name, _)| name.clone())
+            .collect();
+        roots.sort();
+        let mut running = FuturesUnordered::new();
+        let mut observer_jobs = Vec::new();
+        let mut force = self.force.subscribe();
+        let mut remaining = self.tasks.len();
+        for name in roots {
+            let (blocked, input) = self.prepare(&name);
+            let (future, handle) = Self::spawn(
+                name.clone(),
+                self.tasks[&name].clone(),
+                blocked,
+                input,
+                contexts[&name].clone(),
+                self.semaphore.clone(),
+            );
+            guard.handles.push(handle);
+            running.push(future);
+        }
+        drop(start_guard);
+
+        while remaining > 0 {
+            if *force.borrow_and_update() {
+                for event in self.force_settle() {
+                    self.notify(event, &mut observer_jobs);
                 }
-
-                // Task completed, update dependency graph
-                Some(completed_task) = completion_rx.recv() => {
-                    remaining_tasks -= 1;
-                    // Decrease in-degree for all dependent tasks
-                    // If any task reaches 0 in-degree, it's ready to execute
-                    if let Some(children) = self.dependents.get(&completed_task) {
-                        let mut degrees = in_degrees.lock().await;
-                        for child in children {
-                            if let Some(degree) = degrees.get_mut(child) {
-                                *degree -= 1;
-                                if *degree == 0 {
-                                    // Task is now ready (all dependencies satisfied)
-                                    task_tx.send(child.clone()).map_err(|_| {
-                                        Error::TaskExecution("Failed to send child task".to_string())
-                                    })?;
-                                }
-                            }
+                break;
+            }
+            let next = tokio::select! {
+                biased;
+                changed = force.changed() => {
+                    if changed.is_err() {
+                        break;
+                    }
+                    continue;
+                }
+                completion = running.next() => completion,
+            };
+            let Some((name, completed)) = next else {
+                break;
+            };
+            let mut ready = Vec::new();
+            let event = {
+                let mut run = self.run.lock().unwrap();
+                let error = if completed.state == TaskState::Canceled {
+                    if self.controls[&name]
+                        .reason()
+                        .is_some_and(|reason| reason.kind == CancelKind::Task)
+                        || (!contexts[&name].is_cancelled()
+                            && completed.error.as_ref().is_some_and(Error::is_run_canceled))
+                    {
+                        completed.error
+                    } else {
+                        cancellation_error(completed.error, &mut run.cancel_reported)
+                    }
+                } else {
+                    completed.error
+                };
+                let status = run.statuses.get_mut(&name).unwrap();
+                if status.state.done() {
+                    continue;
+                }
+                status.state = completed.state;
+                status.attempts = completed.attempts;
+                status.error = error.map(Arc::new);
+                if let Some(output) = completed.output {
+                    run.order.push(name.clone());
+                    run.outputs.insert(name.clone(), output);
+                }
+                if let Some(children) = self.dependents.get(&name) {
+                    for child in children {
+                        let count = run.degrees.get_mut(child).unwrap();
+                        *count -= 1;
+                        if *count == 0 {
+                            ready.push(child.clone());
                         }
                     }
                 }
-
-                // Handle cancellation request
-                _ = ctx.cancelled() => {
-                    return Err(Error::ContextCancelled("Execution cancelled".to_string()));
+                Event {
+                    task: name.clone(),
+                    status: run.statuses[&name].clone(),
                 }
+            };
+            remaining -= 1;
+            for child in ready {
+                let (blocked, input) = self.prepare(&child);
+                let (future, handle) = Self::spawn(
+                    child.clone(),
+                    self.tasks[&child].clone(),
+                    blocked,
+                    input,
+                    contexts[&child].clone(),
+                    self.semaphore.clone(),
+                );
+                guard.handles.push(handle);
+                running.push(future);
+            }
+            self.notify(event, &mut observer_jobs);
+        }
+
+        let mut observer_failures = Vec::new();
+        for (task, job) in observer_jobs {
+            let error = match job.await {
+                Ok(result) => result.err(),
+                Err(join_error) => Some(Error::ObserverPanic {
+                    task: task.clone(),
+                    message: join_error.to_string(),
+                    stack: std::backtrace::Backtrace::force_capture().to_string(),
+                }),
+            };
+            if let Some(error) = error {
+                observer_failures.push(ObserverFailure {
+                    task,
+                    error: Arc::new(error),
+                });
             }
         }
 
-        // Wait for all spawned tasks to complete
-        try_join_all(handles)
-            .await
-            .map_err(|e| Error::TaskExecution(format!("Join error: {}", e)))?;
-
-        Ok(self.results.read().await.clone())
-    }
-
-    /// Spawns a single task execution in a separate async task
-    /// Handles task preparation, execution, and result storage
-    /// Returns a JoinHandle for the spawned task
-    async fn spawn_task(
-        &self,
-        ctx: CancellationToken,
-        task_name: String,
-        completion_tx: mpsc::UnboundedSender<String>,
-        _concurrency_permit: tokio::sync::OwnedSemaphorePermit,
-    ) -> tokio::task::JoinHandle<Result<(), Error>> {
-        let task = self.tasks.get(&task_name).unwrap().clone();
-        let results = Arc::clone(&self.results);
-        let execution_order = Arc::clone(&self.execution_order);
-
-        tokio::spawn(async move {
-            // Prepare inputs from dependency results
-            let inputs = Self::prepare_inputs(&task, &results).await;
-            // Execute the task with retry logic
-            let output = Self::execute_task(ctx, &task_name, &task, inputs).await?;
-
-            // Record execution order and store results
-            execution_order.lock().await.push(task_name.clone());
-            results.write().await.insert(task_name.clone(), output);
-
-            // Signal completion to the main loop
-            completion_tx.send(task_name).map_err(|_| {
-                Error::TaskExecution("Failed to send completion signal".to_string())
-            })?;
-
-            Ok(())
-        })
-    }
-
-    /// Prepares input data for a task by collecting results from its dependencies
-    /// Creates a HashMap mapping dependency names to their output values
-    async fn prepare_inputs(
-        task: &BoxTask,
-        results: &Arc<RwLock<HashMap<String, TaskResult>>>,
-    ) -> TaskInput {
-        let mut inputs = HashMap::new();
-        let results_read = results.read().await;
-
-        // Collect outputs from all dependency tasks
-        for dep in task.dependencies() {
-            if let Some(value) = results_read.get(&dep) {
-                // Convert task result to JSON value for flexible input handling
-                inputs.insert(dep, serde_json::to_value(value).unwrap());
+        let mut run = self.run.lock().unwrap();
+        let outputs = run.outputs.clone();
+        let mut names: Vec<_> = run.statuses.keys().cloned().collect();
+        names.sort();
+        let mut failures = Vec::new();
+        let mut failed = false;
+        let mut canceled = false;
+        for name in names {
+            let status = &run.statuses[&name];
+            if status.state == TaskState::Failed {
+                failed = true;
+            }
+            if status.state == TaskState::Canceled {
+                canceled = true;
+            }
+            if let Some(error) = &status.error {
+                failures.push(TaskFailure {
+                    task: name,
+                    error: error.clone(),
+                });
             }
         }
-        inputs
-    }
-
-    /// Executes a single task with retry logic and lifecycle hooks
-    /// Handles pre-execution, main execution, and post-execution phases
-    async fn execute_task(
-        ctx: CancellationToken,
-        name: &str,
-        task: &BoxTask,
-        inputs: TaskInput,
-    ) -> Result<TaskResult, Error> {
-        let retry = Retry::new(task.retry_policy());
-
-        // Execute with retry mechanism
-        retry
-            .execute_with_retry(ctx.clone(), name, |attempt| {
-                let ctx = ctx.clone();
-                let task = task.clone();
-                let mut task_inputs = inputs.clone();
-
-                async move {
-                    // Add attempt number to inputs for task awareness
-                    task_inputs.insert("attempt".to_string(), serde_json::json!(attempt));
-
-                    // Execute task lifecycle: pre -> main -> post
-                    task.pre_execution(ctx.clone(), &task_inputs).await?;
-                    let output = task.execute(ctx.clone(), &task_inputs).await?;
-                    task.post_execution(ctx, &output).await?;
-                    Ok(output)
-                }
+        run.phase = if failed {
+            RunPhase::Failed
+        } else if canceled {
+            RunPhase::Canceled
+        } else {
+            RunPhase::Success
+        };
+        guard.finished = true;
+        drop(run);
+        self.done.send_replace(true);
+        if failed || canceled || !observer_failures.is_empty() {
+            Err(RunError {
+                outputs,
+                failures,
+                observer_failures,
+                run_error: None,
             })
-            .await
-    }
-
-    /// Returns a formatted string showing the actual execution order
-    /// Useful for debugging and monitoring task execution flow
-    pub async fn execution_order(&self) -> String {
-        let order = self.execution_order.lock().await;
-        let mut result = String::from("\n");
-        for (i, step) in order.iter().enumerate() {
-            result.push_str(&format!("{}. {}\n", i + 1, step));
+        } else {
+            Ok(outputs)
         }
-        result
     }
+}
 
-    /// Prints the dependency graph structure to console
-    /// Shows the hierarchical relationship between tasks
-    pub fn print_graph(&self) {
-        // Find root tasks (no dependencies)
-        let mut roots = Vec::new();
-        for (name, &degree) in &self.in_degrees {
-            if degree == 0 {
-                roots.push(name.clone());
+pub fn validate(tasks: &HashMap<String, BoxTask>) -> Result<(), Error> {
+    snapshot_dependencies(tasks, false).map(|_| ())
+}
+
+fn snapshot_dependencies(
+    tasks: &HashMap<String, BoxTask>,
+    check_names: bool,
+) -> Result<HashMap<String, Vec<String>>, Error> {
+    let mut names: Vec<_> = tasks.keys().cloned().collect();
+    names.sort();
+    let mut dependencies = HashMap::with_capacity(tasks.len());
+    for name in &names {
+        let task = &tasks[name];
+        if check_names {
+            let actual_name = task.name();
+            if actual_name != name {
+                return Err(Error::TaskNameMismatch {
+                    key: name.clone(),
+                    name: actual_name.into(),
+                });
             }
         }
-
-        // Print each root and its dependency chain
-        for root in roots {
-            println!("{}", root);
-            self.print_chain(&root, "  ");
-            println!();
+        dependencies.insert(name.clone(), task.dependencies());
+    }
+    for name in &names {
+        for dependency in &dependencies[name] {
+            if !tasks.contains_key(dependency) {
+                return Err(Error::UnknownDependency {
+                    task: name.clone(),
+                    dependency: dependency.clone(),
+                });
+            }
         }
     }
 
-    /// Recursively prints the dependency chain starting from a given task
-    /// Uses tree-like formatting to show hierarchical relationships
-    fn print_chain(&self, name: &str, prefix: &str) {
-        if let Some(children) = self.dependents.get(name) {
-            for child in children {
-                println!("{}└─> {}", prefix, child);
-                // Recursive call with increased indentation
-                self.print_chain(child, &format!("{}    ", prefix));
-            }
+    let mut colors = HashMap::new();
+    let mut path = Vec::new();
+    for name in names {
+        if let Some(cycle) = visit(&name, &dependencies, &mut colors, &mut path) {
+            return Err(Error::CircularDependency(cycle.join(" -> ")));
         }
+    }
+    Ok(dependencies)
+}
+
+fn visit(
+    name: &str,
+    dependencies: &HashMap<String, Vec<String>>,
+    colors: &mut HashMap<String, u8>,
+    path: &mut Vec<String>,
+) -> Option<Vec<String>> {
+    match colors.get(name) {
+        Some(2) => return None,
+        Some(1) => {
+            let start = path.iter().position(|item| item == name).unwrap();
+            let mut cycle = path[start..].to_vec();
+            cycle.push(name.to_owned());
+            return Some(cycle);
+        }
+        _ => {}
+    }
+    colors.insert(name.to_owned(), 1);
+    path.push(name.to_owned());
+    for dependency in &dependencies[name] {
+        if let Some(cycle) = visit(dependency, dependencies, colors, path) {
+            return Some(cycle);
+        }
+    }
+    path.pop();
+    colors.insert(name.to_owned(), 2);
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cancellation_error;
+    use crate::Error;
+
+    #[test]
+    fn canceled_tasks_keep_independent_last_errors_without_repeating_run_cause() {
+        let mut reported = false;
+        let first = cancellation_error(
+            Some(Error::ContextCancelled("run stopped".into())),
+            &mut reported,
+        );
+        assert!(matches!(first, Some(Error::ContextCancelled(_))));
+        assert!(reported);
+
+        let second = cancellation_error(
+            Some(Error::RetryInterrupted {
+                last: Box::new(Error::TaskExecution("network unavailable".into())),
+            }),
+            &mut reported,
+        );
+        assert!(
+            matches!(second, Some(Error::TaskExecution(message)) if message == "network unavailable")
+        );
+        assert!(cancellation_error(
+            Some(Error::ContextCancelled("same run".into())),
+            &mut reported
+        )
+        .is_none());
     }
 }
