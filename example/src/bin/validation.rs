@@ -1,12 +1,7 @@
 use async_trait::async_trait;
-use rs_dagcuter::{
-    validate, BoxTask, Dag, Error, RetryPolicy, Task, TaskContext, TaskInput, TaskOutcome,
-    TaskState,
-};
-use serde_json::json;
+use rs_dagcuter::*;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio_util::sync::CancellationToken;
 
 struct Step {
     name: &'static str,
@@ -20,22 +15,33 @@ impl Task for Step {
         self.name
     }
 
-    fn dependencies(&self) -> Vec<String> {
-        self.dependencies.clone()
+    fn dependencies(&self) -> DependencySpec {
+        after(self.dependencies.iter().map(String::as_str))
     }
 
-    fn retry_policy(&self) -> Option<RetryPolicy> {
-        None
-    }
-
-    async fn execute(&self, _ctx: TaskContext, _attempt: u64, input: &TaskInput) -> TaskOutcome {
+    async fn execute(
+        &self,
+        _ctx: TaskContext,
+        _attempt: i64,
+        input: &Input,
+    ) -> (Output, Option<Error>) {
         if self.fails {
-            return TaskOutcome::failure(Error::TaskExecution(format!("{} failed", self.name)));
+            return (
+                Output::default(),
+                Some(Error::TaskExecution(format!("{} failed", self.name))),
+            );
         }
-        TaskOutcome::success(HashMap::from([
-            ("task".into(), json!(self.name)),
-            ("received".into(), json!(input.keys().collect::<Vec<_>>())),
-        ]))
+        (
+            HashMap::from([
+                ("task".into(), Arc::new(self.name) as Value),
+                (
+                    "received".into(),
+                    Arc::new(input.outputs.keys().cloned().collect::<Vec<_>>()) as Value,
+                ),
+            ])
+            .into(),
+            None,
+        )
     }
 }
 
@@ -67,30 +73,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mismatch = HashMap::from([("map-key".into(), step("actual-name", &[], false))]);
     assert!(validate(&mismatch).is_ok());
     assert!(matches!(
-        Dag::new(mismatch),
+        Scheduler::new(mismatch, []),
         Err(Error::TaskNameMismatch { .. })
     ));
     println!("Validation: missing dependency, cycle, and name mismatch rejected");
 
-    let dag = Dag::new(HashMap::from([
-        ("failed".into(), step("failed", &[], true)),
-        ("skipped".into(), step("skipped", &["failed"], false)),
-        ("independent".into(), step("independent", &[], false)),
-    ]))?;
-    let error = dag
-        .execute(CancellationToken::new())
-        .await
-        .expect_err("the failed task must return a run error");
-    assert_eq!(dag.state("failed"), Some(TaskState::Failed));
-    assert_eq!(dag.state("skipped"), Some(TaskState::Skipped));
-    assert_eq!(dag.state("independent"), Some(TaskState::Success));
+    let dag = Scheduler::new(
+        HashMap::from([
+            ("failed".into(), step("failed", &[], true)),
+            ("skipped".into(), step("skipped", &["failed"], false)),
+            ("independent".into(), step("independent", &[], false)),
+        ]),
+        [],
+    )?;
+    let (outputs, error) = dag.execute(Context::new()).await;
+    let error = error.expect("the failed task must return a run error");
+    assert_eq!(dag.state("failed"), State::Failed);
+    assert_eq!(dag.state("skipped"), State::Skipped);
+    assert_eq!(dag.state("independent"), State::Success);
     assert_eq!(error.failures.len(), 1);
-    assert_eq!(error.outputs.len(), 1);
-    assert_eq!(error.outputs["independent"]["task"], "independent");
+    assert_eq!(outputs.len(), 1);
+    assert_eq!(
+        outputs["independent"]["task"]
+            .downcast_ref::<&str>()
+            .copied(),
+        Some("independent")
+    );
     println!(
         "Partial success: states={:?}, outputs={:?}",
         dag.states(),
-        error.outputs
+        outputs
     );
     Ok(())
 }

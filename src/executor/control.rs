@@ -1,13 +1,11 @@
-use super::Dag;
-use crate::control::TaskControl;
-use crate::{CancelCause, CancelKind, CancelReason, Error};
+use super::Scheduler;
+use crate::control::{cause_of, TaskControl};
+use crate::{CancelKind, CancelOption, CancelReason, Context, Error};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::sync::watch;
-use tokio::time::sleep;
 
-impl Dag {
+impl Scheduler {
     fn with_pending_control<F>(&self, name: &str, command: F) -> Result<(), Error>
     where
         F: FnOnce(&Arc<TaskControl>),
@@ -24,15 +22,9 @@ impl Dag {
         Ok(())
     }
 
-    pub fn cancel_task(&self, name: &str) -> Result<(), Error> {
+    pub fn cancel_task(&self, name: &str, options: &[CancelOption]) -> Result<(), Error> {
         self.with_pending_control(name, |control| {
-            control.cancel(CancelReason::new(CancelKind::Task, None));
-        })
-    }
-
-    pub fn cancel_task_with_cause(&self, name: &str, cause: CancelCause) -> Result<(), Error> {
-        self.with_pending_control(name, |control| {
-            control.cancel(CancelReason::new(CancelKind::Task, Some(cause)));
+            control.cancel(CancelReason::new(CancelKind::Task, cause_of(options)));
         })
     }
 
@@ -76,21 +68,8 @@ impl Dag {
         self.cancel_requested.load(Ordering::Acquire)
     }
 
-    pub async fn cancel(&self, grace: Duration) -> Result<(), Error> {
-        self.cancel_with_reason(grace, CancelReason::new(CancelKind::Run, None))
-            .await
-    }
-
-    pub async fn cancel_with_cause(
-        &self,
-        grace: Duration,
-        cause: CancelCause,
-    ) -> Result<(), Error> {
-        self.cancel_with_reason(grace, CancelReason::new(CancelKind::Run, Some(cause)))
-            .await
-    }
-
-    async fn cancel_with_reason(&self, grace: Duration, reason: CancelReason) -> Result<(), Error> {
+    pub async fn cancel(&self, grace: Context, options: &[CancelOption]) -> Result<(), Error> {
+        let reason = CancelReason::new(CancelKind::Run, cause_of(options));
         let start_guard = self.start_gate.lock().unwrap();
         let first = {
             let mut stored = self.cancel_reason.lock().unwrap();
@@ -117,27 +96,13 @@ impl Dag {
         if *done.borrow_and_update() {
             return Ok(());
         }
-        let mut watchdog_done = done.clone();
-        let force = self.force.clone();
-        tokio::spawn(async move {
-            tokio::select! {
-                biased;
-                _ = wait_done(&mut watchdog_done) => {}
-                _ = sleep(grace) => {
-                    if !*watchdog_done.borrow() {
-                        force.send_replace(true);
-                    }
-                }
-            }
-        });
-
         tokio::select! {
             biased;
             _ = wait_done(&mut done) => Ok(()),
-            _ = sleep(grace) => {
+            err = grace.done() => {
                 self.force.send_replace(true);
                 wait_done(&mut done).await;
-                Err(Error::GracePeriodExpired)
+                Err(err)
             }
         }
     }

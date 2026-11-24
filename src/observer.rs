@@ -1,4 +1,4 @@
-use crate::{Error, TaskStatus};
+use crate::{Error, TaskResult};
 use std::any::Any;
 use std::backtrace::Backtrace;
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -7,7 +7,7 @@ use std::sync::Arc;
 #[derive(Debug, Clone)]
 pub struct Event {
     pub task: String,
-    pub status: TaskStatus,
+    pub task_result: TaskResult,
 }
 
 #[derive(Debug, Clone)]

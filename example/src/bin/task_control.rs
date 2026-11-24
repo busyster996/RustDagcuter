@@ -1,9 +1,5 @@
 use async_trait::async_trait;
-use rs_dagcuter::{
-    BoxTask, CancelCause, CancelKind, CancelReason, Dag, Error, RetryPolicy, Task, TaskContext,
-    TaskInput, TaskOutcome, TaskState,
-};
-use serde_json::json;
+use rs_dagcuter::*;
 use std::collections::HashMap;
 use std::error::Error as StdError;
 use std::fmt;
@@ -11,7 +7,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::Notify;
-use tokio_util::sync::CancellationToken;
 
 enum Mode {
     Success,
@@ -31,20 +26,22 @@ impl Task for Step {
         self.name
     }
 
-    fn dependencies(&self) -> Vec<String> {
-        self.deps.clone()
+    fn dependencies(&self) -> DependencySpec {
+        after(self.deps.iter().map(String::as_str))
     }
 
-    fn retry_policy(&self) -> Option<RetryPolicy> {
-        None
-    }
-
-    async fn execute(&self, ctx: TaskContext, _attempt: u64, _input: &TaskInput) -> TaskOutcome {
+    async fn execute(
+        &self,
+        ctx: TaskContext,
+        _attempt: i64,
+        _input: &Input,
+    ) -> (Output, Option<Error>) {
         self.calls.fetch_add(1, Ordering::SeqCst);
         match &self.mode {
-            Mode::Success => {
-                TaskOutcome::success(HashMap::from([("task".into(), json!(self.name))]))
-            }
+            Mode::Success => (
+                HashMap::from([("task".into(), Arc::new(self.name) as Value)]).into(),
+                None,
+            ),
             Mode::WaitForCancel(started, reasons) => {
                 started.notify_one();
                 ctx.cancelled().await;
@@ -56,7 +53,10 @@ impl Task for Step {
                     reason.source.is_some()
                 );
                 reasons.lock().unwrap().push(reason);
-                TaskOutcome::failure(Error::ContextCancelled("task stopped by caller".into()))
+                (
+                    Output::default(),
+                    Some(Error::ContextCancelled("task stopped by caller".into())),
+                )
             }
         }
     }
@@ -90,14 +90,14 @@ impl StdError for OperatorReason {}
 async fn main() -> Result<(), Box<dyn StdError>> {
     let (gated, gated_calls) = step("gated", &[], Mode::Success);
     let (free, _) = step("free", &[], Mode::Success);
-    let dag = Arc::new(Dag::new(HashMap::from([
-        ("gated".into(), gated),
-        ("free".into(), free),
-    ]))?);
+    let dag = Arc::new(Scheduler::new(
+        HashMap::from([("gated".into(), gated), ("free".into(), free)]),
+        [],
+    )?);
     dag.suspend_task("gated")?;
     dag.suspend();
     let runner = dag.clone();
-    let handle = tokio::spawn(async move { runner.execute(CancellationToken::new()).await });
+    let handle = tokio::spawn(async move { runner.execute(Context::new()).await });
     tokio::time::sleep(Duration::from_millis(30)).await;
     assert_eq!(dag.progress().pending, 2);
     dag.resume();
@@ -105,9 +105,8 @@ async fn main() -> Result<(), Box<dyn StdError>> {
     assert_eq!(gated_calls.load(Ordering::SeqCst), 0);
     assert!(dag.suspended_task("gated"));
     dag.resume_task("gated")?;
-    let outputs = tokio::time::timeout(Duration::from_secs(2), handle)
-        .await??
-        .expect("both suspended tasks should succeed");
+    let (outputs, err) = tokio::time::timeout(Duration::from_secs(2), handle).await??;
+    assert!(err.is_none());
     assert_eq!(outputs.len(), 2);
     println!(
         "Suspension: both sources resumed, {} tasks succeeded",
@@ -123,24 +122,26 @@ async fn main() -> Result<(), Box<dyn StdError>> {
     );
     let (child, child_calls) = step("child", &["target"], Mode::Success);
     let (independent, _) = step("independent", &[], Mode::Success);
-    let dag = Arc::new(Dag::new(HashMap::from([
-        ("target".into(), target),
-        ("child".into(), child),
-        ("independent".into(), independent),
-    ]))?);
+    let dag = Arc::new(Scheduler::new(
+        HashMap::from([
+            ("target".into(), target),
+            ("child".into(), child),
+            ("independent".into(), independent),
+        ]),
+        [],
+    )?);
     let runner = dag.clone();
-    let handle = tokio::spawn(async move { runner.execute(CancellationToken::new()).await });
+    let handle = tokio::spawn(async move { runner.execute(Context::new()).await });
     started.notified().await;
     let cause: CancelCause = Arc::new(OperatorReason);
-    dag.cancel_task_with_cause("target", cause)?;
-    let error = tokio::time::timeout(Duration::from_secs(2), handle)
-        .await??
-        .expect_err("target is canceled");
-    assert_eq!(dag.state("target"), Some(TaskState::Canceled));
-    assert_eq!(dag.state("child"), Some(TaskState::Canceled));
-    assert_eq!(dag.state("independent"), Some(TaskState::Success));
+    dag.cancel_task("target", &[with_cause(cause)])?;
+    let (outputs, error) = tokio::time::timeout(Duration::from_secs(2), handle).await??;
+    assert_eq!(error.expect("target is canceled").failures.len(), 1);
+    assert_eq!(dag.state("target"), State::Canceled);
+    assert_eq!(dag.state("child"), State::Canceled);
+    assert_eq!(dag.state("independent"), State::Success);
     assert_eq!(child_calls.load(Ordering::SeqCst), 0);
-    assert!(error.outputs.contains_key("independent"));
+    assert!(outputs.contains_key("independent"));
     let reason = &reasons.lock().unwrap()[0];
     assert_eq!(reason.kind, CancelKind::Task);
     assert_eq!(

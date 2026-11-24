@@ -1,8 +1,7 @@
 use async_trait::async_trait;
-use rs_dagcuter::{BoxTask, Dag, RetryPolicy, Task, TaskContext, TaskInput, TaskOutcome};
+use rs_dagcuter::*;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio_util::sync::CancellationToken;
 
 // 示例任务实现
 struct ExampleTask {
@@ -16,31 +15,39 @@ impl Task for ExampleTask {
         &self.name
     }
 
-    fn dependencies(&self) -> Vec<String> {
-        self.deps.clone()
+    fn dependencies(&self) -> DependencySpec {
+        after(self.deps.iter().map(String::as_str))
     }
 
-    fn retry_policy(&self) -> Option<RetryPolicy> {
-        Some(RetryPolicy {
+    fn retry_policy(&self) -> RetryPolicy {
+        RetryPolicy {
             max_attempts: 3,
             ..Default::default()
-        })
+        }
     }
 
-    async fn execute(&self, _ctx: TaskContext, _attempt: u64, _input: &TaskInput) -> TaskOutcome {
+    async fn execute(
+        &self,
+        _ctx: TaskContext,
+        _attempt: i64,
+        _input: &Input,
+    ) -> (Output, Option<Error>) {
         println!("执行任务: {}", self.name);
 
         // 模拟任务执行时间
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         let mut result = HashMap::new();
-        result.insert("status".to_string(), serde_json::json!("completed"));
-        result.insert("task_name".to_string(), serde_json::json!(self.name));
+        result.insert("status".to_string(), Arc::new("completed") as Value);
+        result.insert(
+            "task_name".to_string(),
+            Arc::new(self.name.clone()) as Value,
+        );
         result.insert(
             "timestamp".to_string(),
-            serde_json::json!(chrono::Utc::now().to_rfc3339()),
+            Arc::new(chrono::Utc::now().to_rfc3339()),
         );
-        TaskOutcome::success(result)
+        (result.into(), None)
     }
 }
 
@@ -100,21 +107,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }),
     );
 
-    let dag = Dag::new(tasks)?;
-    let ctx = CancellationToken::new();
+    let dag = Scheduler::new(tasks, [])?;
+    let ctx = Context::new();
 
     println!("=== 任务依赖图 ===");
     dag.print_graph();
 
     println!("=== 开始执行任务 ===");
     let start = std::time::Instant::now();
-    let results = dag.execute(ctx).await?;
+    let (results, err) = dag.execute(ctx).await;
+    if let Some(err) = err {
+        return Err(err.into());
+    }
     let duration = start.elapsed();
 
     println!("=== 执行完成 ===");
     println!("执行时间: {:?}", duration);
     println!("执行结果: {:#?}", results);
-    println!("执行顺序: {}", dag.execution_order().await);
+    println!("执行顺序: {}", dag.success_completion_order());
 
     Ok(())
 }

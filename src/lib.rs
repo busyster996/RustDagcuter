@@ -1,5 +1,7 @@
 mod control;
+mod edge;
 mod executor;
+mod interface;
 mod observer;
 mod options;
 mod progress;
@@ -13,8 +15,10 @@ use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
 
-pub type TaskResult = HashMap<String, serde_json::Value>;
-pub type TaskInput = HashMap<String, serde_json::Value>;
+/// Opaque task data, shared read-only through `Arc`. Recover a value with `downcast_ref`.
+pub type Data = HashMap<String, Value>;
+pub type Value = Arc<dyn std::any::Any + Send + Sync>;
+pub type Outputs = HashMap<String, Data>;
 pub type BoxTask = Arc<dyn Task>;
 pub const INFINITE_ATTEMPTS: i64 = -1;
 
@@ -28,8 +32,14 @@ pub enum Error {
     TaskNameMismatch { key: String, name: String },
     #[error("this DAG has already been executed")]
     AlreadyExecuted,
+    #[error("task {0:?} exited without a result")]
+    TaskAbandoned(String),
     #[error("task execution failed: {0}")]
     TaskExecution(String),
+    #[error(transparent)]
+    TaskError(#[from] Box<dyn std::error::Error + Send + Sync>),
+    #[error("task {task:?} emitted the reserved trigger {trigger:?}")]
+    InvalidEmit { task: String, trigger: Trigger },
     #[error("execution canceled: {0}")]
     ContextCancelled(String),
     #[error("retries exhausted: {last}")]
@@ -39,12 +49,6 @@ pub enum Error {
     },
     #[error("non-retryable error: {0}")]
     NonRetryable(#[source] Box<Error>),
-    #[error("execute: {execute}; post_execution: {post}")]
-    TaskAndPostExecution {
-        #[source]
-        execute: Box<Error>,
-        post: Box<Error>,
-    },
     #[error("execution canceled during retry wait; last attempt: {last}")]
     RetryInterrupted {
         #[source]
@@ -53,7 +57,7 @@ pub enum Error {
     #[error("task {task:?} panicked on attempt {attempt}: {message}")]
     TaskPanic {
         task: String,
-        attempt: u64,
+        attempt: i64,
         message: String,
         stack: String,
         #[source]
@@ -82,21 +86,48 @@ pub enum Error {
         #[source]
         last: Option<Box<Error>>,
     },
-    #[error("cancel grace period expired")]
-    GracePeriodExpired,
+    #[error("context deadline exceeded")]
+    DeadlineExceeded,
+    #[error("context deadline exceeded: {last}")]
+    DeadlineInterrupted {
+        #[source]
+        last: Box<Error>,
+    },
 }
 
 impl Error {
     pub(crate) fn is_non_retryable(&self) -> bool {
         match self {
-            Self::NonRetryable(_) => true,
-            Self::TaskAndPostExecution { execute, post } => {
-                execute.is_non_retryable() || post.is_non_retryable()
-            }
+            Self::NonRetryable(_) | Self::InvalidEmit { .. } => true,
             Self::RetryFailed { last } | Self::RetryInterrupted { last } => last.is_non_retryable(),
             Self::TaskPanic { source, .. } => source.as_deref().is_some_and(Self::is_non_retryable),
             _ => false,
         }
+    }
+
+    pub(crate) fn is_context_error(&self) -> bool {
+        match self {
+            Self::ContextCancelled(_)
+            | Self::DeadlineExceeded
+            | Self::DeadlineInterrupted { .. }
+            | Self::RetryInterrupted { .. } => true,
+            Self::RetryFailed { last } | Self::NonRetryable(last) => last.is_context_error(),
+            Self::TaskPanic { source, .. } => source.as_deref().is_some_and(Self::is_context_error),
+            _ => false,
+        }
+    }
+
+    pub(crate) fn is_interruption(&self) -> bool {
+        self.is_context_error()
+            || self.is_run_canceled()
+            || match self {
+                Self::TaskCanceled { .. } => true,
+                Self::RetryFailed { last } | Self::NonRetryable(last) => last.is_interruption(),
+                Self::TaskPanic { source, .. } => {
+                    source.as_deref().is_some_and(Self::is_interruption)
+                }
+                _ => false,
+            }
     }
 
     pub(crate) fn is_run_canceled(&self) -> bool {
@@ -105,17 +136,15 @@ impl Error {
             Self::RetryFailed { last }
             | Self::RetryInterrupted { last }
             | Self::NonRetryable(last) => last.is_run_canceled(),
-            Self::TaskAndPostExecution { execute, post } => {
-                execute.is_run_canceled() || post.is_run_canceled()
-            }
             Self::TaskPanic { source, .. } => source.as_deref().is_some_and(Self::is_run_canceled),
             _ => false,
         }
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TaskState {
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum State {
+    #[default]
     Pending,
     Success,
     Skipped,
@@ -123,14 +152,27 @@ pub enum TaskState {
     Failed,
 }
 
-impl TaskState {
+impl fmt::Display for State {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Pending => "pending",
+            Self::Success => "success",
+            Self::Skipped => "skipped",
+            Self::Canceled => "canceled",
+            Self::Failed => "failed",
+        })
+    }
+}
+
+impl State {
     pub fn done(self) -> bool {
         self != Self::Pending
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RunPhase {
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum Phase {
+    #[default]
     Pending,
     Running,
     Success,
@@ -138,17 +180,29 @@ pub enum RunPhase {
     Failed,
 }
 
-impl RunPhase {
+impl fmt::Display for Phase {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Pending => "pending",
+            Self::Running => "running",
+            Self::Success => "success",
+            Self::Canceled => "canceled",
+            Self::Failed => "failed",
+        })
+    }
+}
+
+impl Phase {
     pub fn done(self) -> bool {
         matches!(self, Self::Success | Self::Canceled | Self::Failed)
     }
 }
 
 #[derive(Debug, Clone)]
-pub struct TaskStatus {
-    pub state: TaskState,
-    pub error: Option<Arc<Error>>,
-    pub attempts: u64,
+pub struct TaskResult {
+    pub state: State,
+    pub err: Option<Arc<Error>>,
+    pub attempts: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -159,7 +213,6 @@ pub struct TaskFailure {
 
 #[derive(Debug)]
 pub struct RunError {
-    pub outputs: HashMap<String, TaskResult>,
     pub failures: Vec<TaskFailure>,
     pub observer_failures: Vec<ObserverFailure>,
     pub run_error: Option<Box<Error>>,
@@ -176,22 +229,19 @@ impl fmt::Display for RunError {
         if let Some(error) = &self.run_error {
             return error.fmt(f);
         }
-        if self.failures.is_empty() {
-            write!(
-                f,
-                "{} observer callback(s) panicked",
-                self.observer_failures.len()
-            )
-        } else if self.observer_failures.is_empty() {
-            write!(f, "{} task(s) failed or were canceled", self.failures.len())
-        } else {
-            write!(
-                f,
-                "{} task(s) failed or were canceled; {} observer callback(s) panicked",
-                self.failures.len(),
-                self.observer_failures.len()
-            )
+        for (index, err) in self
+            .failures
+            .iter()
+            .map(|entry| &entry.error)
+            .chain(self.observer_failures.iter().map(|entry| &entry.error))
+            .enumerate()
+        {
+            if index > 0 {
+                writeln!(f)?;
+            }
+            write!(f, "{err}")?;
         }
+        Ok(())
     }
 }
 
@@ -213,7 +263,7 @@ impl std::error::Error for RunError {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RetryPolicy {
     pub interval: Duration,
     pub max_interval: Duration,
@@ -223,77 +273,46 @@ pub struct RetryPolicy {
     pub jitter: f64,
 }
 
-impl Default for RetryPolicy {
-    fn default() -> Self {
-        Self {
-            interval: Duration::from_secs(1),
-            max_interval: Duration::from_secs(30),
-            max_attempts: 1,
-            multiplier: 2.0,
-            jitter: 0.0,
-        }
-    }
-}
-
-#[derive(Debug)]
-pub struct TaskOutcome {
-    pub output: Option<TaskResult>,
-    pub error: Option<Error>,
-}
-
-impl TaskOutcome {
-    pub fn success(output: TaskResult) -> Self {
-        Self {
-            output: Some(output),
-            error: None,
-        }
-    }
-
-    pub fn failure(error: Error) -> Self {
-        Self {
-            output: None,
-            error: Some(error),
-        }
-    }
-
-    pub fn with_error(output: TaskResult, error: Error) -> Self {
-        Self {
-            output: Some(output),
-            error: Some(error),
-        }
-    }
-}
-
 #[async_trait]
 pub trait Task: Send + Sync {
     fn name(&self) -> &str;
-    fn dependencies(&self) -> Vec<String>;
-    fn retry_policy(&self) -> Option<RetryPolicy>;
 
-    async fn pre_execution(
-        &self,
-        _ctx: TaskContext,
-        _attempt: u64,
-        _input: &TaskInput,
-    ) -> Result<(), Error> {
-        Ok(())
+    fn dependencies(&self) -> DependencySpec {
+        DependencySpec::default()
     }
 
-    async fn execute(&self, ctx: TaskContext, attempt: u64, input: &TaskInput) -> TaskOutcome;
+    fn retry_policy(&self) -> RetryPolicy {
+        RetryPolicy::default()
+    }
+
+    async fn pre_execution(&self, _ctx: TaskContext, _attempt: i64, _input: &Input) {}
+
+    async fn execute(
+        &self,
+        ctx: TaskContext,
+        attempt: i64,
+        input: &Input,
+    ) -> (Output, Option<Error>);
 
     async fn post_execution(
         &self,
         _ctx: TaskContext,
-        _attempt: u64,
-        _output: Option<&TaskResult>,
-        _error: Option<&Error>,
-    ) -> Result<(), Error> {
-        Ok(())
+        _attempt: i64,
+        _output: &Output,
+        _err: Option<&Error>,
+    ) {
     }
 }
 
-pub use control::{CancelCause, CancelKind, CancelReason, TaskContext};
-pub use executor::{validate, Dag};
+pub use control::{
+    with_cause, CancelCause, CancelKind, CancelOption, CancelReason, Context, TaskContext,
+};
+pub use edge::{
+    after, DependencyEdge, DependencySpec, Input, JoinPolicy, Output, Trigger, ON_FAILURE,
+    ON_SUCCESS,
+};
+pub use executor::{validate, Scheduler};
+pub use interface::{Control, SchedulerApi};
 pub use observer::{Event, ObserverFailure};
-pub use options::DagOptions;
+pub use options::{with_max_concurrency, with_observer, SchedulerOption};
 pub use progress::Progress;

@@ -1,13 +1,13 @@
-use super::Dag;
-use crate::{Progress, RunPhase, TaskState, TaskStatus};
+use super::Scheduler;
+use crate::{Phase, Progress, State, TaskResult};
 use std::collections::HashMap;
 
-impl Dag {
-    pub fn phase(&self) -> RunPhase {
+impl Scheduler {
+    pub fn phase(&self) -> Phase {
         self.run.lock().unwrap().phase
     }
 
-    pub fn states(&self) -> HashMap<String, TaskState> {
+    pub fn states(&self) -> HashMap<String, State> {
         self.run
             .lock()
             .unwrap()
@@ -17,11 +17,16 @@ impl Dag {
             .collect()
     }
 
-    pub fn state(&self, name: &str) -> Option<TaskState> {
-        self.run.lock().unwrap().statuses.get(name).map(|s| s.state)
+    pub fn state(&self, name: &str) -> State {
+        self.run
+            .lock()
+            .unwrap()
+            .statuses
+            .get(name)
+            .map_or(State::Pending, |s| s.state)
     }
 
-    pub fn task_results(&self) -> HashMap<String, TaskStatus> {
+    pub fn results(&self) -> HashMap<String, TaskResult> {
         self.run.lock().unwrap().statuses.clone()
     }
 
@@ -33,11 +38,11 @@ impl Dag {
         };
         for status in run.statuses.values() {
             match status.state {
-                TaskState::Pending => progress.pending += 1,
-                TaskState::Success => progress.success += 1,
-                TaskState::Skipped => progress.skipped += 1,
-                TaskState::Canceled => progress.canceled += 1,
-                TaskState::Failed => progress.failed += 1,
+                State::Pending => progress.pending += 1,
+                State::Success => progress.success += 1,
+                State::Skipped => progress.skipped += 1,
+                State::Canceled => progress.canceled += 1,
+                State::Failed => progress.failed += 1,
             }
         }
         progress

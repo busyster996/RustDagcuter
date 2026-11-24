@@ -1,15 +1,10 @@
 use async_trait::async_trait;
-use rs_dagcuter::{
-    BoxTask, Dag, Error, RetryPolicy, Task, TaskContext, TaskInput, TaskOutcome, TaskResult,
-    TaskState,
-};
-use serde_json::json;
+use rs_dagcuter::*;
 use std::collections::HashMap;
 use std::panic::panic_any;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio_util::sync::CancellationToken;
 
 #[derive(Clone, Copy)]
 enum Mode {
@@ -38,12 +33,8 @@ impl Task for Step {
         self.name
     }
 
-    fn dependencies(&self) -> Vec<String> {
-        Vec::new()
-    }
-
-    fn retry_policy(&self) -> Option<RetryPolicy> {
-        Some(RetryPolicy {
+    fn retry_policy(&self) -> RetryPolicy {
+        RetryPolicy {
             max_attempts: match self.mode {
                 Mode::Transient => 2,
                 Mode::Permanent => 3,
@@ -53,34 +44,38 @@ impl Task for Step {
             interval: Duration::from_millis(20),
             jitter: 0.2,
             ..RetryPolicy::default()
-        })
+        }
     }
 
-    async fn pre_execution(
-        &self,
-        _ctx: TaskContext,
-        attempt: u64,
-        _input: &TaskInput,
-    ) -> Result<(), Error> {
+    async fn pre_execution(&self, _ctx: TaskContext, attempt: i64, _input: &Input) {
         self.hooks.pre.fetch_add(1, Ordering::SeqCst);
         println!("{}: pre_execution attempt {attempt}", self.name);
-        Ok(())
     }
 
-    async fn execute(&self, _ctx: TaskContext, attempt: u64, _input: &TaskInput) -> TaskOutcome {
+    async fn execute(
+        &self,
+        _ctx: TaskContext,
+        attempt: i64,
+        _input: &Input,
+    ) -> (Output, Option<Error>) {
         match self.mode {
-            Mode::Transient if attempt == 1 => {
-                TaskOutcome::failure(Error::TaskExecution("temporary failure".into()))
-            }
-            Mode::Transient => {
-                TaskOutcome::success(HashMap::from([("attempt".into(), json!(attempt))]))
-            }
-            Mode::Permanent => TaskOutcome::failure(Error::NonRetryable(Box::new(
-                Error::TaskExecution("invalid request".into()),
-            ))),
-            Mode::OutputError => TaskOutcome::with_error(
-                HashMap::from([("partial".into(), json!(true))]),
-                Error::TaskExecution("output and error".into()),
+            Mode::Transient if attempt == 1 => (
+                Output::default(),
+                Some(Error::TaskExecution("temporary failure".into())),
+            ),
+            Mode::Transient => (
+                HashMap::from([("attempt".into(), Arc::new(attempt) as Value)]).into(),
+                None,
+            ),
+            Mode::Permanent => (
+                Output::default(),
+                Some(Error::NonRetryable(Box::new(Error::TaskExecution(
+                    "invalid request".into(),
+                )))),
+            ),
+            Mode::OutputError => (
+                Data::from([("partial".into(), Arc::new(true) as Value)]).into(),
+                Some(Error::TaskExecution("output and error".into())),
             ),
             Mode::Panic => panic_any(Error::NonRetryable(Box::new(Error::TaskExecution(
                 "expected task panic with non-retryable cause".into(),
@@ -91,21 +86,20 @@ impl Task for Step {
     async fn post_execution(
         &self,
         _ctx: TaskContext,
-        attempt: u64,
-        output: Option<&TaskResult>,
+        attempt: i64,
+        output: &Output,
         error: Option<&Error>,
-    ) -> Result<(), Error> {
+    ) {
         self.hooks.post.fetch_add(1, Ordering::SeqCst);
-        if output.is_some() && error.is_some() {
+        if !output.data.is_empty() && error.is_some() {
             self.hooks.both.fetch_add(1, Ordering::SeqCst);
         }
         println!(
             "{}: post_execution attempt {attempt}, output={}, error={}",
             self.name,
-            output.is_some(),
+            !output.data.is_empty(),
             error.is_some()
         );
-        Ok(())
     }
 }
 
@@ -127,36 +121,42 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (permanent, permanent_hooks) = step("permanent", Mode::Permanent);
     let (partial, partial_hooks) = step("partial", Mode::OutputError);
     let (panic_step, panic_hooks) = step("panic", Mode::Panic);
-    let dag = Dag::new(HashMap::from([
-        ("transient".into(), transient),
-        ("permanent".into(), permanent),
-        ("partial".into(), partial),
-        ("panic".into(), panic_step),
-    ]))?;
+    let dag = Scheduler::new(
+        HashMap::from([
+            ("transient".into(), transient),
+            ("permanent".into(), permanent),
+            ("partial".into(), partial),
+            ("panic".into(), panic_step),
+        ]),
+        [],
+    )?;
     println!(
         "One task panic is intentional; Rust's panic hook prints it before the DAG catches it."
     );
-    let error = dag
-        .execute(CancellationToken::new())
-        .await
-        .expect_err("three tasks deliberately fail");
-    let statuses = dag.task_results();
-    assert_eq!(statuses["transient"].state, TaskState::Success);
+    let (outputs, error) = dag.execute(Context::new()).await;
+    let error = error.expect("three tasks deliberately fail");
+    let statuses = dag.results();
+    assert_eq!(statuses["transient"].state, State::Success);
     assert_eq!(statuses["transient"].attempts, 2);
-    assert_eq!(error.outputs["transient"]["attempt"], 2);
+    assert_eq!(
+        outputs["transient"]["attempt"]
+            .downcast_ref::<i64>()
+            .copied(),
+        Some(2)
+    );
     assert_eq!(statuses["permanent"].attempts, 1);
     assert!(matches!(
-        statuses["permanent"].error.as_deref(),
+        statuses["permanent"].err.as_deref(),
         Some(Error::NonRetryable(_))
     ));
     assert_eq!(statuses["panic"].attempts, 1);
     assert!(matches!(
-        statuses["panic"].error.as_deref(),
+        statuses["panic"].err.as_deref(),
         Some(Error::TaskPanic { source: Some(source), .. })
             if matches!(source.as_ref(), Error::NonRetryable(_))
     ));
-    assert_eq!(statuses["partial"].state, TaskState::Failed);
-    assert!(!error.outputs.contains_key("partial"));
+    assert_eq!(statuses["partial"].state, State::Failed);
+    assert!(!outputs.contains_key("partial"));
     assert_eq!(partial_hooks.both.load(Ordering::SeqCst), 1);
     assert_eq!(partial_hooks.post.load(Ordering::SeqCst), 1);
     assert_eq!(error.failures.len(), 3);
@@ -183,7 +183,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     println!(
         "Retry result: {} success, {} deliberate failures",
-        error.outputs.len(),
+        outputs.len(),
         error.failures.len()
     );
     Ok(())

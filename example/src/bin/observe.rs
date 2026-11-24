@@ -1,15 +1,10 @@
 use async_trait::async_trait;
-use rs_dagcuter::{
-    BoxTask, Dag, DagOptions, Event, RetryPolicy, RunPhase, Task, TaskContext, TaskInput,
-    TaskOutcome, TaskState,
-};
-use serde_json::json;
+use rs_dagcuter::*;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::Semaphore;
-use tokio_util::sync::CancellationToken;
 
 struct Step {
     name: String,
@@ -25,15 +20,12 @@ impl Task for Step {
         &self.name
     }
 
-    fn dependencies(&self) -> Vec<String> {
-        Vec::new()
-    }
-
-    fn retry_policy(&self) -> Option<RetryPolicy> {
-        None
-    }
-
-    async fn execute(&self, _ctx: TaskContext, _attempt: u64, _input: &TaskInput) -> TaskOutcome {
+    async fn execute(
+        &self,
+        _ctx: TaskContext,
+        _attempt: i64,
+        _input: &Input,
+    ) -> (Output, Option<Error>) {
         let count = self.active.fetch_add(1, Ordering::SeqCst) + 1;
         self.peak.fetch_max(count, Ordering::SeqCst);
         self.started.fetch_add(1, Ordering::SeqCst);
@@ -41,7 +33,10 @@ impl Task for Step {
             gate.acquire().await.expect("gate remains open").forget();
         }
         self.active.fetch_sub(1, Ordering::SeqCst);
-        TaskOutcome::success(HashMap::from([("task".into(), json!(self.name))]))
+        (
+            HashMap::from([("task".into(), Arc::new(self.name.clone()) as Value)]).into(),
+            None,
+        )
     }
 }
 
@@ -78,14 +73,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             )
         })
         .collect();
-    let options = DagOptions::default()
-        .max_concurrency(2)
-        .observer(move |event| {
+    let options = [
+        with_max_concurrency(2),
+        with_observer(move |event| {
             received.lock().unwrap().push(event);
-        });
-    let dag = Arc::new(Dag::with_options(tasks, options)?);
+        }),
+    ];
+    let dag = Arc::new(Scheduler::new(tasks, options)?);
     let runner = dag.clone();
-    let handle = tokio::spawn(async move { runner.execute(CancellationToken::new()).await });
+    let handle = tokio::spawn(async move { runner.execute(Context::new()).await });
     tokio::time::timeout(Duration::from_secs(2), async {
         while started.load(Ordering::SeqCst) < 2 {
             tokio::task::yield_now().await;
@@ -97,7 +93,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!((during.total, during.pending, during.done()), (3, 3, 0));
     println!("During execution: {during}");
     gate.add_permits(3);
-    let results = tokio::time::timeout(Duration::from_secs(2), handle).await???;
+    let (results, err) = tokio::time::timeout(Duration::from_secs(2), handle).await??;
+    assert!(err.is_none());
     assert_eq!(results.len(), 3);
     assert_eq!(peak.load(Ordering::SeqCst), 2);
     assert_eq!(events.lock().unwrap().len(), 3);
@@ -108,20 +105,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let panic_task = step("observed", None, &active, &peak, &started);
-    let dag = Dag::with_options(
+    let dag = Scheduler::new(
         HashMap::from([("observed".into(), panic_task)]),
-        DagOptions::default().observer(|_| panic!("expected observer panic")),
+        [with_observer(|_| panic!("expected observer panic"))],
     )?;
     println!("One observer panic is intentional; it does not change the successful task state.");
-    let error = dag
-        .execute(CancellationToken::new())
-        .await
-        .expect_err("observer panics are reported");
-    assert_eq!(dag.phase(), RunPhase::Success);
-    assert_eq!(dag.state("observed"), Some(TaskState::Success));
+    let (outputs, error) = dag.execute(Context::new()).await;
+    let error = error.expect("observer panics are reported");
+    assert_eq!(dag.phase(), Phase::Success);
+    assert_eq!(dag.state("observed"), State::Success);
     assert!(error.failures.is_empty());
     assert_eq!(error.observer_failures.len(), 1);
-    assert!(error.outputs.contains_key("observed"));
+    assert!(outputs.contains_key("observed"));
     println!(
         "Observer panic reported separately: {}",
         error.observer_failures[0].error

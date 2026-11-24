@@ -1,16 +1,102 @@
 use crate::Error;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::AtomicI64;
 use std::sync::{Arc, Mutex};
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
 pub type CancelCause = Arc<dyn std::error::Error + Send + Sync>;
 
+/// A Tokio cancellation token with an optional deadline.
+#[derive(Clone, Debug, Default)]
+pub struct Context {
+    token: CancellationToken,
+    pub(crate) deadline: Option<tokio::time::Instant>,
+}
+
+impl Context {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_deadline(self, deadline: tokio::time::Instant) -> Self {
+        let deadline = self.deadline.map_or(deadline, |prior| prior.min(deadline));
+        Self {
+            deadline: Some(deadline),
+            ..self
+        }
+    }
+
+    pub fn with_timeout(self, timeout: std::time::Duration) -> Self {
+        let Some(deadline) = tokio::time::Instant::now().checked_add(timeout) else {
+            return self;
+        };
+        self.with_deadline(deadline)
+    }
+
+    pub fn cancel(&self) {
+        self.token.cancel();
+    }
+
+    pub(crate) fn token(&self) -> &CancellationToken {
+        &self.token
+    }
+
+    pub(crate) fn error(&self) -> Option<Error> {
+        if self.token.is_cancelled() {
+            Some(Error::ContextCancelled("context canceled".into()))
+        } else if self
+            .deadline
+            .is_some_and(|at| tokio::time::Instant::now() >= at)
+        {
+            Some(Error::DeadlineExceeded)
+        } else {
+            None
+        }
+    }
+
+    pub async fn done(&self) -> Error {
+        if let Some(err) = self.error() {
+            return err;
+        }
+        if let Some(at) = self.deadline {
+            tokio::select! {
+                biased;
+                _ = self.token.cancelled() => Error::ContextCancelled("context canceled".into()),
+                _ = tokio::time::sleep_until(at) => Error::DeadlineExceeded,
+            }
+        } else {
+            self.token.cancelled().await;
+            Error::ContextCancelled("context canceled".into())
+        }
+    }
+}
+
+impl From<CancellationToken> for Context {
+    fn from(token: CancellationToken) -> Self {
+        Self {
+            token,
+            deadline: None,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct CancelOption(CancelCause);
+
+pub fn with_cause(cause: CancelCause) -> CancelOption {
+    CancelOption(cause)
+}
+
+pub(crate) fn cause_of(options: &[CancelOption]) -> Option<CancelCause> {
+    options.last().map(|option| option.0.clone())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CancelKind {
     Task,
     Run,
     Parent,
+    TaskDone,
 }
 
 #[derive(Debug, Clone)]
@@ -29,6 +115,7 @@ impl CancelReason {
 pub struct TaskContext {
     token: CancellationToken,
     control: Arc<TaskControl>,
+    parent: Context,
 }
 
 impl TaskContext {
@@ -44,11 +131,26 @@ impl TaskContext {
         if !self.is_cancelled() {
             return None;
         }
-        Some(
-            self.control
-                .reason()
-                .unwrap_or_else(|| CancelReason::new(CancelKind::Parent, None)),
-        )
+        Some(self.control.reason().unwrap_or_else(|| {
+            CancelReason::new(
+                CancelKind::Parent,
+                self.parent.error().map(|err| Arc::new(err) as CancelCause),
+            )
+        }))
+    }
+
+    pub(crate) fn release_on_drop(&self) -> impl Drop {
+        struct Release(Arc<TaskControl>);
+        impl Drop for Release {
+            fn drop(&mut self) {
+                let mut state = self.0.state.lock().unwrap();
+                if !state.token.is_cancelled() {
+                    state.reason = Some(CancelReason::new(CancelKind::TaskDone, None));
+                    state.token.cancel();
+                }
+            }
+        }
+        Release(self.control.clone())
     }
 
     pub(crate) fn token(&self) -> &CancellationToken {
@@ -70,8 +172,14 @@ impl TaskContext {
                 reason: self.cause().unwrap(),
                 last: underlying.map(Box::new),
             },
-            _ => underlying
-                .unwrap_or_else(|| Error::ContextCancelled("parent context canceled".into())),
+            _ => match (self.parent.error(), underlying) {
+                (Some(Error::DeadlineExceeded), Some(Error::RetryInterrupted { last })) => {
+                    Error::DeadlineInterrupted { last }
+                }
+                (Some(Error::DeadlineExceeded), _) => Error::DeadlineExceeded,
+                (_, underlying) => underlying
+                    .unwrap_or_else(|| Error::ContextCancelled("parent context canceled".into())),
+            },
         }
     }
 }
@@ -87,7 +195,7 @@ pub(crate) struct TaskControl {
     name: String,
     state: Mutex<ControlState>,
     paused: watch::Sender<bool>,
-    pub(crate) attempts: AtomicU64,
+    pub(crate) attempts: AtomicI64,
 }
 
 impl TaskControl {
@@ -102,12 +210,16 @@ impl TaskControl {
                 run_suspended: false,
             }),
             paused,
-            attempts: AtomicU64::new(0),
+            attempts: AtomicI64::new(0),
         }
     }
 
-    pub(crate) fn bind(self: &Arc<Self>, parent: &CancellationToken) -> TaskContext {
-        let token = parent.child_token();
+    pub(crate) fn bind(
+        self: &Arc<Self>,
+        token: &CancellationToken,
+        parent: &Context,
+    ) -> TaskContext {
+        let token = token.child_token();
         let mut state = self.state.lock().unwrap();
         if state.reason.is_some() {
             token.cancel();
@@ -116,17 +228,14 @@ impl TaskControl {
         TaskContext {
             token,
             control: self.clone(),
+            parent: parent.clone(),
         }
     }
 
     pub(crate) fn cancel(&self, requested: CancelReason) {
         let mut state = self.state.lock().unwrap();
-        if state.reason.is_none() {
-            state.reason = Some(if state.token.is_cancelled() {
-                CancelReason::new(CancelKind::Parent, None)
-            } else {
-                requested
-            });
+        if state.reason.is_none() && !state.token.is_cancelled() {
+            state.reason = Some(requested);
         }
         state.token.cancel();
     }
